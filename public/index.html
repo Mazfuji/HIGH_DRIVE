@@ -146,7 +146,7 @@
 
       const COLS = 40;
       const ROWS = 25;
-      const GAME_COLS = 28;
+      const GAME_COLS = 29;
       const CELL = 8;
       const PLAYER_Y = 18;
       const ROAD_SPACES = 11;
@@ -245,9 +245,9 @@
 
       function drawRoadRow(y, left) {
         for (let x = 0; x < GAME_COLS; x++) setCell(x, y, 226);
-        setCell(left, y, 227);
+        setCell(left, y, 228);
         for (let x = roadMin(); x <= roadMax(); x++) setCell(x, y, 32);
-        setCell(roadRight(), y, 228);
+        setCell(roadRight(), y, 227);
       }
 
       function title() {
@@ -393,7 +393,7 @@
 
       function drawStatus() {
         const statusColor = COLORS.wall;
-        fillRect(28, 0, 12, ROWS, 32);
+        fillRect(29, 0, 11, ROWS, 32);
         printText(29, 2, "HIGH SCORE", statusColor);
         printText(32, 4, String(state.highScore).padStart(5, " "), statusColor);
         printText(29, 7, "YOUR SCORE", statusColor);

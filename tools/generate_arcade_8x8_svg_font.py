@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SVG_PATH = ROOT / "arcade_8x8_ascii_font.svg"
+SVG_PATH = ROOT / "public" / "arcade_8x8_ascii_font.svg"
 PX = 100
 CELL = 8
 ACTIVE = 7
@@ -234,6 +234,7 @@ def render() -> str:
 
 
 def main() -> None:
+    SVG_PATH.parent.mkdir(parents=True, exist_ok=True)
     SVG_PATH.write_text(render(), encoding="utf-8")
     print(f"wrote {SVG_PATH.relative_to(ROOT)}")
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BAS_PATH = ROOT / "high_drive.bas"
-SVG_PATH = ROOT / "high_drive_defchr.svg"
+SVG_PATH = ROOT / "public" / "high_drive_defchr.svg"
 
 DEFCHR_RE = re.compile(r'DEFCHR\$\((\d+)\)=HEXCHR\$\("([0-9A-Fa-f]+)"\)')
 
@@ -99,6 +99,7 @@ def render_svg(chars: list[tuple[int, bytes]]) -> str:
 
 def main() -> None:
     chars = parse_defchrs(BAS_PATH.read_text(encoding="utf-8"))
+    SVG_PATH.parent.mkdir(parents=True, exist_ok=True)
     SVG_PATH.write_text(render_svg(chars), encoding="utf-8")
     print(f"wrote {SVG_PATH.relative_to(ROOT)} ({len(chars)} characters)")
 
