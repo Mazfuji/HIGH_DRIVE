@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HIGH DRIVE</title>
+  <style>
+    @font-face {
+      font-family: "Arcade8x8ASCII";
+      src: url("arcade_8x8_ascii_font.svg#Arcade8x8ASCII") format("svg");
+    }
+
+    :root {
+      color-scheme: dark;
+      --screen-green: #78ff70;
+      --screen-amber: #ffd95c;
+      --screen-red: #ff5959;
+      --screen-cyan: #58e7ff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+      background: #101114;
+      color: var(--screen-green);
+      font-family: "Arcade8x8ASCII", monospace;
+      overflow: hidden;
+    }
+
+    body {
+      display: grid;
+      place-items: center;
+    }
+
+    .cabinet {
+      width: min(100vw, 128vh);
+      max-width: 960px;
+      padding: clamp(10px, 2.2vw, 22px);
+      background: #202226;
+      border: 1px solid #3a3c42;
+      box-shadow:
+        inset 0 0 0 2px #111317,
+        0 24px 70px rgba(0, 0, 0, .5);
+    }
+
+    .bezel {
+      position: relative;
+      padding: clamp(8px, 1.5vw, 16px);
+      background: #050606;
+      border: 1px solid #32363a;
+    }
+
+    svg {
+      display: block;
+      width: 100%;
+      aspect-ratio: 40 / 25;
+      background: #050807;
+      image-rendering: pixelated;
+      shape-rendering: crispEdges;
+    }
+
+    .scanlines {
+      position: absolute;
+      inset: clamp(8px, 1.5vw, 16px);
+      pointer-events: none;
+      background: repeating-linear-gradient(
+        to bottom,
+        rgba(255, 255, 255, .04) 0,
+        rgba(255, 255, 255, .04) 1px,
+        rgba(0, 0, 0, .08) 2px,
+        rgba(0, 0, 0, .08) 4px
+      );
+      mix-blend-mode: screen;
+      opacity: .45;
+    }
+
+    .fullscreen-button {
+      position: absolute;
+      right: clamp(12px, 2vw, 20px);
+      bottom: clamp(12px, 2vw, 20px);
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      color: #f2f2f2;
+      background: rgba(5, 6, 6, .72);
+      border: 1px solid #555b62;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+
+    .fullscreen-button svg {
+      width: 20px;
+      height: 20px;
+      margin: 7px;
+      background: transparent;
+      aspect-ratio: 1;
+      stroke: currentColor;
+    }
+
+    .fullscreen-button:focus-visible {
+      outline: 2px solid var(--screen-cyan);
+      outline-offset: 2px;
+    }
+
+    .cabinet:fullscreen {
+      width: 100vw;
+      max-width: none;
+      height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: min(2vh, 18px);
+      background: #050606;
+    }
+
+    .cabinet:fullscreen .bezel {
+      width: min(calc(100vw - 36px), calc((100vh - 36px) * 1.6));
+      padding: min(1.5vh, 14px);
+    }
+
+    .cabinet:fullscreen .scanlines {
+      inset: min(1.5vh, 14px);
+    }
+  </style>
+</head>
+<body>
+  <main class="cabinet">
+    <div class="bezel">
+      <svg id="screen" viewBox="0 0 320 200" aria-label="HIGH DRIVE game screen"></svg>
+      <div class="scanlines"></div>
+      <button class="fullscreen-button" id="fullscreenButton" type="button" aria-label="Toggle fullscreen" title="Fullscreen (F)">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="square">
+          <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/>
+        </svg>
+      </button>
+    </div>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const COLS = 40;
+      const ROWS = 25;
+      const GAME_COLS = 28;
+      const CELL = 8;
+      const PLAYER_Y = 18;
+      const ROAD_SPACES = 11;
+      const FRAME_MS = 92;
+      const HAZARD_DELAY_MS = FRAME_MS / 2;
+      const CUSTOM = new Set([224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235]);
+      const NS = "http://www.w3.org/2000/svg";
+      const XLINK = "http://www.w3.org/1999/xlink";
+      const screen = document.getElementById("screen");
+      const cabinet = document.querySelector(".cabinet");
+      const fullscreenButton = document.getElementById("fullscreenButton");
+      const cells = [];
+      const state = {
+        mode: "title",
+        playerX: 14,
+        shadowX: 14,
+        roadLeft: 8,
+        score: 0,
+        highScore: 20000,
+        stage: 1,
+        tick: 0,
+        stageTick: 0,
+        lastMove: 0,
+        keys: new Set(),
+        chase: null,
+        iceGap: 9,
+        barrel: null,
+        flash: 0,
+        bonusRemaining: 0,
+        delayedHazardToken: 0,
+      };
+
+      const COLORS = {
+        main: "#78ff70",
+        dim: "#227d39",
+        wall: "#f2f2f2",
+        road: "#050807",
+        text: "#78ff70",
+        red: "#ff5959",
+        amber: "#ffd95c",
+        cyan: "#58e7ff",
+      };
+
+      const buffer = Array.from({ length: ROWS }, () =>
+        Array.from({ length: COLS }, () => ({ code: 32, color: COLORS.main }))
+      );
+
+      function makeScreen() {
+        const bg = document.createElementNS(NS, "rect");
+        bg.setAttribute("width", "320");
+        bg.setAttribute("height", "200");
+        bg.setAttribute("fill", "#050807");
+        screen.appendChild(bg);
+
+        for (let y = 0; y < ROWS; y++) {
+          for (let x = 0; x < COLS; x++) {
+            const use = document.createElementNS(NS, "use");
+            use.setAttribute("x", x * CELL);
+            use.setAttribute("y", y * CELL);
+            use.setAttribute("width", CELL);
+            use.setAttribute("height", CELL);
+            use.style.imageRendering = "pixelated";
+            screen.appendChild(use);
+            cells.push(use);
+          }
+        }
+      }
+
+      function setCell(x, y, code, color = COLORS.main) {
+        if (x < 0 || x >= COLS || y < 0 || y >= ROWS) return;
+        buffer[y][x].code = code;
+        buffer[y][x].color = color;
+      }
+
+      function printText(x, y, text, color = COLORS.text) {
+        for (let i = 0; i < text.length; i++) {
+          setCell(x + i, y, text.charCodeAt(i), color);
+        }
+      }
+
+      function fillRect(x, y, w, h, code, color = COLORS.main) {
+        for (let yy = y; yy < y + h; yy++) {
+          for (let xx = x; xx < x + w; xx++) setCell(xx, yy, code, color);
+        }
+      }
+
+      function clearAll() {
+        fillRect(0, 0, COLS, ROWS, 32);
+      }
+
+      function clearGameArea() {
+        fillRect(0, 0, GAME_COLS, ROWS, 226);
+        for (let y = 0; y < ROWS; y++) drawRoadRow(y, state.roadLeft);
+      }
+
+      function drawRoadRow(y, left) {
+        for (let x = 0; x < GAME_COLS; x++) setCell(x, y, 226);
+        setCell(left, y, 227);
+        for (let x = roadMin(); x <= roadMax(); x++) setCell(x, y, 32);
+        setCell(roadRight(), y, 228);
+      }
+
+      function title() {
+        resetGame();
+        clearAll();
+        clearGameArea();
+        printText(9, 6, "HIGH DRIVE", COLORS.amber);
+        printText(9, 15, "HIT ANY KEY", COLORS.text);
+        setCell(state.playerX, PLAYER_Y, 224);
+        drawStatus();
+        render();
+      }
+
+      function resetGame() {
+        state.mode = "title";
+        state.playerX = 14;
+        state.shadowX = 14;
+        state.roadLeft = 8;
+        state.score = 0;
+        state.stage = 1;
+        state.tick = 0;
+        state.stageTick = 0;
+        state.lastMove = 0;
+        state.chase = null;
+        state.iceGap = roadMin();
+        state.barrel = null;
+        state.flash = 0;
+        state.bonusRemaining = 0;
+        state.delayedHazardToken = 0;
+      }
+
+      function startGame() {
+        state.mode = "play";
+        state.tick = 0;
+        state.stageTick = 0;
+        clearAll();
+        clearGameArea();
+      }
+
+      function shiftGameDown() {
+        for (let y = ROWS - 1; y > 0; y--) {
+          for (let x = 0; x < GAME_COLS; x++) {
+            buffer[y][x].code = buffer[y - 1][x].code;
+            buffer[y][x].color = buffer[y - 1][x].color;
+          }
+        }
+      }
+
+      function spawnTopRow() {
+        const section = ((state.stage - 1) % 6) + 1;
+        const loop = Math.floor((state.stage - 1) / 6);
+        drawRoadRow(0, state.roadLeft);
+
+        if (section === 1 && state.stageTick > 0 && state.stageTick % 10 === 0) {
+          const gap = randInt(roadMin(), roadMax() - 3);
+          for (let x = roadMin(); x <= roadMax(); x++) setCell(x, 0, 231);
+          for (let x = gap; x < gap + 4; x++) setCell(x, 0, 32);
+        }
+
+        if (section === 2 && Math.random() < Math.min(.1 + loop * .06, .34)) {
+          setCell(randInt(roadMin(), roadMax()), 0, 225);
+        }
+
+        if (section === 3) {
+          state.iceGap = clamp(state.iceGap + randInt(-1, 1), roadMin(), roadMax() - 3);
+          for (let x = roadMin(); x <= roadMax(); x++) setCell(x, 0, 233);
+          for (let x = state.iceGap; x < state.iceGap + 4; x++) setCell(x, 0, 32);
+        }
+
+        if (section === 4 && Math.random() < .15) {
+          setCell(randInt(roadMin(), roadMax()), 0, 233);
+        }
+
+        if (section === 4 && state.stageTick > 22 && state.stageTick % 18 === 0) {
+          const x0 = randInt(roadMin(), roadMax() - 4);
+          for (let x = x0; x < x0 + 5; x++) setCell(x, 0, 234);
+        }
+
+        if (section === 5 && Math.random() < Math.min(.08 + loop * .05, .28)) {
+          setCell(randInt(roadMin(), roadMax()), 0, 225);
+        }
+
+        if (section === 6 && Math.random() < .2) {
+          setCell(randInt(roadMin(), roadMax()), 0, Math.random() < .12 ? 230 : 229);
+        }
+      }
+
+      function updateChaser() {
+        if (((state.stage - 1) % 6) + 1 !== 5) return;
+        if (!state.chase || state.chase.y > 22) {
+          state.chase = { x: randInt(roadMin(), roadMax()), y: 0 };
+        }
+        const oldX = state.chase.x;
+        const oldY = state.chase.y + 1;
+        state.chase.x += randInt(-1, 1);
+        state.chase.x = clamp(state.chase.x, roadMin(), roadMax());
+        state.chase.y += 2;
+        if (buffer[oldY]?.[oldX]?.code === 235) setCell(oldX, oldY, 32);
+        if (state.chase.x === state.playerX && state.chase.y === PLAYER_Y) {
+          crash();
+          return;
+        }
+        if (state.chase.y < ROWS) setCell(state.chase.x, state.chase.y, 235);
+      }
+
+      function updateBarrels() {
+        if (((state.stage - 1) % 6) + 1 !== 4) return;
+        for (let y = ROWS - 1; y >= 0; y--) {
+          for (let x = roadMin(); x <= roadMax(); x++) {
+            if (buffer[y][x].code !== 234) continue;
+            setCell(x, y, 32);
+            if (x === state.playerX && y + 1 === PLAYER_Y) {
+              crash();
+              return;
+            }
+            if (y + 1 < ROWS) setCell(x, y + 1, 234);
+          }
+        }
+      }
+
+      function updatePlayer() {
+        let move = 0;
+        if (state.keys.has("ArrowLeft") || state.keys.has("KeyA")) move -= 1;
+        if (state.keys.has("ArrowRight") || state.keys.has("KeyD")) move += 1;
+        state.lastMove = move;
+        state.shadowX = state.playerX;
+        const nextX = clamp(state.playerX + move, 1, GAME_COLS - 2);
+        const hit = buffer[PLAYER_Y][nextX].code;
+
+        if (hit === 229) {
+          state.score += 100;
+        } else if (hit === 230) {
+          state.score += 1000;
+        } else if (hit !== 32 && hit !== 232) {
+          crash();
+          return;
+        }
+
+        state.playerX = nextX;
+        setCell(state.shadowX, PLAYER_Y + 1, 232);
+        setCell(state.playerX, PLAYER_Y, 224);
+      }
+
+      function drawStatus() {
+        const statusColor = COLORS.wall;
+        fillRect(28, 0, 12, ROWS, 32);
+        printText(29, 2, "HIGH SCORE", statusColor);
+        printText(32, 4, String(state.highScore).padStart(5, " "), statusColor);
+        printText(29, 7, "YOUR SCORE", statusColor);
+        printText(31, 9, String(state.score).padStart(6, " "), statusColor);
+        if (state.stage % 6 === 0) {
+          printText(29, 12, "BONUS RODE", statusColor);
+        } else {
+          printText(29, 12, "RODE :" + String(state.stage).padStart(4, " "), statusColor);
+        }
+      }
+
+      function frame() {
+        if (state.mode === "bonus_count") {
+          updateBonusCount();
+          return;
+        }
+        if (state.mode !== "play") return;
+        state.tick++;
+        state.stageTick++;
+        state.score++;
+        state.highScore = Math.max(state.highScore, state.score);
+
+        const stageAtFrameStart = currentStage();
+        const delayedHazards = stageAtFrameStart === 4 || stageAtFrameStart === 5;
+
+        shiftGameDown();
+        spawnTopRow();
+        if (!delayedHazards) {
+          updateBarrels();
+          if (state.mode !== "play") return;
+          updateChaser();
+        }
+        updatePlayer();
+        if (state.mode !== "play") return;
+
+        if (state.stageTick >= 200) {
+          const endedBonusStage = currentStage() === 6;
+          state.stage++;
+          state.stageTick = 0;
+          state.chase = null;
+          state.barrel = null;
+          state.iceGap = roadMin();
+          if (endedBonusStage) {
+            startBonusCount(Math.floor(state.score / 10));
+          }
+        }
+        drawStatus();
+        render();
+        if (delayedHazards && state.mode === "play" && currentStage() === stageAtFrameStart) {
+          scheduleDelayedHazards(state.stage, state.stageTick);
+        }
+      }
+
+      function scheduleDelayedHazards(stage, stageTick) {
+        const token = ++state.delayedHazardToken;
+        window.setTimeout(() => {
+          if (state.mode !== "play") return;
+          if (state.delayedHazardToken !== token) return;
+          if (state.stage !== stage || state.stageTick !== stageTick) return;
+          updateBarrels();
+          if (state.mode !== "play") return;
+          updateChaser();
+          if (state.mode !== "play") return;
+          drawStatus();
+          render();
+        }, HAZARD_DELAY_MS);
+      }
+
+      function startBonusCount(amount) {
+        state.mode = "bonus_count";
+        state.bonusRemaining = amount;
+        printBonusCountLabel();
+        drawStatus();
+        render();
+      }
+
+      function updateBonusCount() {
+        state.tick++;
+        const step = Math.max(1, Math.ceil(state.bonusRemaining / 20));
+        const add = Math.min(step, state.bonusRemaining);
+        state.score += add;
+        state.bonusRemaining -= add;
+        state.highScore = Math.max(state.highScore, state.score);
+        printBonusCountLabel();
+        drawStatus();
+        render();
+        if (state.bonusRemaining <= 0) {
+          printText(12, 10, "     ", COLORS.main);
+          state.mode = "play";
+          render();
+        }
+      }
+
+      function printBonusCountLabel() {
+        const colors = [COLORS.wall, COLORS.amber, COLORS.cyan, COLORS.red, COLORS.main];
+        printText(12, 10, "BONUS", colors[state.tick % colors.length]);
+      }
+
+      function crash() {
+        state.mode = "over";
+        state.flash = 70;
+        drawStatus();
+        printText(10, 10, "Try again", COLORS.red);
+        printText(9, 12, "[ Y or N ]?", COLORS.red);
+        render();
+      }
+
+      function render() {
+        for (let y = 0; y < ROWS; y++) {
+          for (let x = 0; x < COLS; x++) {
+            const item = buffer[y][x];
+            const use = cells[y * COLS + x];
+            const code = item.code;
+            const href = CUSTOM.has(code)
+              ? `high_drive_defchr.svg#char-${code}`
+              : `arcade_8x8_ascii_font.svg#px-${code >= 32 && code <= 127 ? code : 32}`;
+            use.setAttribute("href", href);
+            use.setAttributeNS(XLINK, "href", href);
+            use.setAttribute("fill", item.color);
+            use.style.visibility = code === 32 ? "hidden" : "visible";
+          }
+        }
+      }
+
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      function randInt(min, max) {
+        return Math.floor(Math.random() * (max - min + 1)) + min;
+      }
+
+      function currentStage() {
+        return ((state.stage - 1) % 6) + 1;
+      }
+
+      function roadMin() {
+        return state.roadLeft + 1;
+      }
+
+      function roadMax() {
+        return state.roadLeft + ROAD_SPACES;
+      }
+
+      function roadRight() {
+        return state.roadLeft + ROAD_SPACES + 1;
+      }
+
+      function toggleFullscreen() {
+        if (!document.fullscreenElement) {
+          cabinet.requestFullscreen?.();
+        } else {
+          document.exitFullscreen?.();
+        }
+      }
+
+      window.addEventListener("keydown", (event) => {
+        state.keys.add(event.code);
+        if (["ArrowLeft", "ArrowRight", "Space", "KeyA", "KeyD", "KeyF"].includes(event.code)) event.preventDefault();
+
+        if (event.code === "KeyF") {
+          toggleFullscreen();
+          return;
+        }
+
+        if (state.mode === "title") {
+          startGame();
+          return;
+        }
+        if (state.mode === "over") {
+          if (event.key === "y" || event.key === "Y") {
+            const highScore = state.highScore;
+            resetGame();
+            state.highScore = highScore;
+            startGame();
+          }
+          if (event.key === "n" || event.key === "N") title();
+        }
+      });
+
+      window.addEventListener("keyup", (event) => {
+        state.keys.delete(event.code);
+      });
+
+      fullscreenButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggleFullscreen();
+      });
+
+      makeScreen();
+      title();
+      setInterval(frame, FRAME_MS);
+    })();
+  </script>
+</body>
+</html>
