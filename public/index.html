@@ -153,6 +153,7 @@
       const FRAME_MS = 92;
       const HAZARD_DELAY_MS = FRAME_MS / 2;
       const CUSTOM = new Set([224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235]);
+      const HIGH_SCORE_KEY = "high-drive.high-score";
       const NS = "http://www.w3.org/2000/svg";
       const XLINK = "http://www.w3.org/1999/xlink";
       const screen = document.getElementById("screen");
@@ -165,7 +166,7 @@
         shadowX: 14,
         roadLeft: 8,
         score: 0,
-        highScore: 20000,
+        highScore: loadHighScore(),
         stage: 1,
         tick: 0,
         stageTick: 0,
@@ -413,7 +414,7 @@
         state.tick++;
         state.stageTick++;
         state.score++;
-        state.highScore = Math.max(state.highScore, state.score);
+        updateHighScore();
 
         const stageAtFrameStart = currentStage();
         const delayedHazards = stageAtFrameStart === 4 || stageAtFrameStart === 5;
@@ -475,7 +476,7 @@
         const add = Math.min(step, state.bonusRemaining);
         state.score += add;
         state.bonusRemaining -= add;
-        state.highScore = Math.max(state.highScore, state.score);
+        updateHighScore();
         printBonusCountLabel();
         drawStatus();
         render();
@@ -525,6 +526,26 @@
         return Math.floor(Math.random() * (max - min + 1)) + min;
       }
 
+
+      function loadHighScore() {
+        try {
+          const value = Number.parseInt(localStorage.getItem(HIGH_SCORE_KEY) || "", 10);
+          return Number.isFinite(value) && value > 0 ? value : 20000;
+        } catch {
+          return 20000;
+        }
+      }
+
+      function updateHighScore() {
+        if (state.score <= state.highScore) return;
+        state.highScore = state.score;
+        try {
+          localStorage.setItem(HIGH_SCORE_KEY, String(state.highScore));
+        } catch {
+          // Ignore storage errors; the in-memory score still updates.
+        }
+      }
+
       function currentStage() {
         return ((state.stage - 1) % 6) + 1;
       }
@@ -564,9 +585,7 @@
         }
         if (state.mode === "over") {
           if (event.key === "y" || event.key === "Y") {
-            const highScore = state.highScore;
             resetGame();
-            state.highScore = highScore;
             startGame();
           }
           if (event.key === "n" || event.key === "N") title();

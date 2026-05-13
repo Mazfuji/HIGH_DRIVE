@@ -6,6 +6,11 @@
 ## ファイル構成
 
 - `high_drive.bas` - Hu-BASIC CZ-8CB01 用のゲーム本体
+- `high_drive.html` - ブラウザで遊べるレトロカーアクション版
+- `arcade_8x8_ascii_font.svg` - ASCII 8x8 SVG フォント
+- `high_drive_defchr.svg` - `DEFCHR$` から生成した独自キャラクタ SVG
+- `public/` - Firebase Hosting 公開用ファイル
+- `firebase.json` - Firebase Hosting 設定
 
 ## 動作環境
 
@@ -23,6 +28,26 @@ RUN
 ```
 
 環境によっては、ファイル名や読み込み方法が異なる場合があります。エミュレータを使う場合は、テキスト形式の BASIC プログラムを読み込める形式に変換するか、エミュレータ側の貼り付け・ロード機能を使ってください。
+
+ブラウザ版はローカルサーバーから起動します。
+
+```sh
+python3 -m http.server 8000 -d public
+```
+
+その後、`http://localhost:8000/` を開きます。外部 SVG を参照するため、ブラウザで HTML を直接開くより HTTP 経由での確認を推奨します。
+
+## Firebase Hosting
+
+Firebase CLI を使ってデプロイします。
+
+```sh
+firebase login
+firebase init hosting
+firebase deploy
+```
+
+`firebase init hosting` では公開ディレクトリに `public` を指定し、既存の `public/index.html` は上書きしないでください。すでに Firebase プロジェクトを関連付け済みの場合は、`firebase deploy` だけで公開できます。
 
 ## ゲームの流れ
 
