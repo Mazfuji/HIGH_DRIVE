@@ -160,6 +160,8 @@
       const cabinet = document.querySelector(".cabinet");
       const fullscreenButton = document.getElementById("fullscreenButton");
       const cells = [];
+      let psg = null;
+      let soundToken = 0;
       const state = {
         mode: "title",
         playerX: 14,
@@ -194,6 +196,201 @@
       const buffer = Array.from({ length: ROWS }, () =>
         Array.from({ length: COLS }, () => ({ code: 32, color: COLORS.main }))
       );
+
+      class Ay38910 {
+        constructor() {
+          this.clock = 1789750;
+          this.context = null;
+          this.node = null;
+          this.registers = new Uint8Array(16);
+          this.tonePhase = [0, 0, 0];
+          this.toneOutput = [1, 1, 1];
+          this.noisePhase = 0;
+          this.noiseOutput = 1;
+          this.noiseLfsr = 0x1ffff;
+          this.envelopePhase = 0;
+          this.envelopeStep = 0;
+          this.envelopeShape = 0;
+          this.masterGain = .16;
+          this.volumeTable = Array.from({ length: 16 }, (_, i) => {
+            return i === 0 ? 0 : Math.pow(10, (i - 15) * 1.5 / 20);
+          });
+        }
+
+        async start() {
+          if (!this.context) {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContext) return;
+            this.context = new AudioContext();
+            this.node = this.context.createScriptProcessor(1024, 0, 1);
+            this.node.onaudioprocess = (event) => this.process(event.outputBuffer.getChannelData(0));
+            this.node.connect(this.context.destination);
+            this.mute();
+          }
+          if (this.context.state === "suspended") await this.context.resume();
+        }
+
+        write(register, value) {
+          this.registers[register & 15] = value & 255;
+          if ((register & 15) === 13) {
+            this.envelopeShape = value & 15;
+            this.envelopeStep = (this.envelopeShape & 4) ? 0 : 15;
+            this.envelopePhase = 0;
+          }
+        }
+
+        mute() {
+          this.write(7, 63);
+          this.write(8, 0);
+          this.write(9, 0);
+          this.write(10, 0);
+        }
+
+        sound(register, value) {
+          this.start();
+          this.write(register, value);
+        }
+
+        tone(channel, note, duration = .08, volume = 12) {
+          this.start();
+          const semitones = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+          const midi = (note.octave + 1) * 12 + semitones[note.name];
+          const freq = 440 * Math.pow(2, (midi - 69) / 12);
+          const period = Math.max(1, Math.round(this.clock / (16 * freq)));
+          const lo = channel * 2;
+          this.write(lo, period & 255);
+          this.write(lo + 1, (period >> 8) & 15);
+          this.write(7, this.registers[7] & ~(1 << channel));
+          this.write(8 + channel, volume & 15);
+          window.setTimeout(() => this.write(8 + channel, 0), duration * 1000);
+        }
+
+        process(output) {
+          if (!this.context) return;
+          const sampleRate = this.context.sampleRate;
+          for (let i = 0; i < output.length; i++) {
+            const noisePeriod = Math.max(1, this.registers[6] & 31);
+            const noiseFreq = this.clock / (16 * noisePeriod);
+            this.noisePhase += noiseFreq / sampleRate;
+            while (this.noisePhase >= 1) {
+              this.noisePhase -= 1;
+              const bit = (this.noiseLfsr ^ (this.noiseLfsr >> 3)) & 1;
+              this.noiseLfsr = (this.noiseLfsr >> 1) | (bit << 16);
+              this.noiseOutput = (this.noiseLfsr & 1) ? 1 : -1;
+            }
+
+            this.advanceEnvelope(sampleRate);
+            let mix = 0;
+            for (let ch = 0; ch < 3; ch++) {
+              const period = Math.max(1, ((this.registers[ch * 2 + 1] & 15) << 8) | this.registers[ch * 2]);
+              const freq = this.clock / (16 * period);
+              this.tonePhase[ch] += freq / sampleRate;
+              while (this.tonePhase[ch] >= 1) {
+                this.tonePhase[ch] -= 1;
+                this.toneOutput[ch] *= -1;
+              }
+
+              const toneEnabled = (this.registers[7] & (1 << ch)) === 0;
+              const noiseEnabled = (this.registers[7] & (1 << (ch + 3))) === 0;
+              const tone = toneEnabled ? this.toneOutput[ch] : 1;
+              const noise = noiseEnabled ? this.noiseOutput : 1;
+              const ampRegister = this.registers[8 + ch];
+              const level = (ampRegister & 16) ? this.envelopeLevel() : (ampRegister & 15);
+              mix += tone * noise * this.volumeTable[level];
+            }
+            output[i] = Math.max(-1, Math.min(1, mix * this.masterGain));
+          }
+        }
+
+        advanceEnvelope(sampleRate) {
+          const period = Math.max(1, (this.registers[12] << 8) | this.registers[11]);
+          this.envelopePhase += (this.clock / (256 * period)) / sampleRate;
+          while (this.envelopePhase >= 1) {
+            this.envelopePhase -= 1;
+            if (this.envelopeShape & 4) {
+              this.envelopeStep++;
+              if (this.envelopeStep > 15) this.envelopeStep = (this.envelopeShape & 8) ? 0 : 15;
+            } else {
+              this.envelopeStep--;
+              if (this.envelopeStep < 0) this.envelopeStep = (this.envelopeShape & 8) ? 15 : 0;
+            }
+          }
+        }
+
+        envelopeLevel() {
+          return (this.envelopeShape & 4) ? this.envelopeStep : 15 - this.envelopeStep;
+        }
+      }
+
+      function ensureSound() {
+        if (!psg) psg = new Ay38910();
+        psg.start();
+      }
+
+      function sound(register, value) {
+        if (!psg) return;
+        psg.sound(register, value);
+      }
+
+      function startSoundCue() {
+        ensureSound();
+        const token = ++soundToken;
+        psg.tone(1, { name: "A", octave: 4 }, .18, 13);
+        window.setTimeout(() => {
+          if (soundToken === token) psg.tone(1, { name: "A", octave: 4 }, .18, 13);
+        }, 300);
+        window.setTimeout(() => {
+          if (soundToken === token) psg.tone(1, { name: "A", octave: 4 }, .18, 13);
+        }, 600);
+        window.setTimeout(() => {
+          if (soundToken !== token) return;
+          sound(0, 141);
+          sound(1, 0);
+          sound(7, 10);
+          sound(8, 31);
+          sound(12, 40);
+          sound(13, 9);
+        }, 820);
+        window.setTimeout(() => {
+          if (soundToken === token) engineSound();
+        }, 1250);
+      }
+
+      function engineSound() {
+        if (!psg || state.mode !== "play") return;
+        const pitch = clamp(210 - state.stage * 6 - Math.abs(state.lastMove) * 20, 40, 255);
+        sound(0, pitch);
+        sound(1, 2);
+        sound(7, 10);
+        sound(8, 31);
+        sound(12, 1);
+        sound(13, 10);
+      }
+
+      function crashSound() {
+        ensureSound();
+        const token = ++soundToken;
+        sound(0, 180);
+        sound(1, 12);
+        sound(6, 63);
+        sound(7, 17);
+        sound(8, 31);
+        sound(12, 50);
+        sound(13, 9);
+        window.setTimeout(() => {
+          if (soundToken === token) psg?.mute();
+        }, 900);
+      }
+
+      function bonusSound(big) {
+        ensureSound();
+        psg.tone(1, { name: "A", octave: big ? 5 : 4 }, .12, 14);
+      }
+
+      function bonusCountSound() {
+        ensureSound();
+        psg.tone(1, { name: "C", octave: 5 }, .05, 10);
+      }
 
       function makeScreen() {
         const bg = document.createElementNS(NS, "rect");
@@ -251,6 +448,7 @@
       }
 
       function title() {
+        if (psg) psg.mute();
         resetGame();
         clearAll();
         clearGameArea();
@@ -285,6 +483,7 @@
         state.stageTick = 0;
         clearAll();
         clearGameArea();
+        startSoundCue();
       }
 
       function shiftGameDown() {
@@ -379,8 +578,10 @@
 
         if (hit === 229) {
           state.score += 100;
+          bonusSound(false);
         } else if (hit === 230) {
           state.score += 1000;
+          bonusSound(true);
         } else if (hit !== 32 && hit !== 232) {
           crash();
           return;
@@ -428,6 +629,7 @@
         }
         updatePlayer();
         if (state.mode !== "play") return;
+        engineSound();
 
         if (state.stageTick >= 200) {
           const endedBonusStage = currentStage() === 6;
@@ -483,6 +685,7 @@
         if (state.bonusRemaining <= 0) {
           printText(12, 10, "     ", COLORS.main);
           state.mode = "play";
+          engineSound();
           render();
         }
       }
@@ -490,11 +693,13 @@
       function printBonusCountLabel() {
         const colors = [COLORS.wall, COLORS.amber, COLORS.cyan, COLORS.red, COLORS.main];
         printText(12, 10, "BONUS", colors[state.tick % colors.length]);
+        bonusCountSound();
       }
 
       function crash() {
         state.mode = "over";
         state.flash = 70;
+        crashSound();
         drawStatus();
         printText(10, 10, "Try again", COLORS.red);
         printText(9, 12, "[ Y or N ]?", COLORS.red);
