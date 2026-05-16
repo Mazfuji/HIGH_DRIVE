@@ -8,6 +8,19 @@ const srcDir = path.join(root, "src");
 const publicDir = path.join(root, "public");
 const aySourcePath = path.join(srcDir, "ay38910.ts");
 const mainSourcePath = path.join(srcDir, "main.ts");
+const basSourcePath = path.join(root, "high_drive.bas");
+const iconCharacterCode = 224;
+const defchrPattern = /DEFCHR\$\((\d+)\)=HEXCHR\$\("([0-9A-Fa-f]+)"\)/g;
+const defchrColors = {
+  0: null,
+  1: "#0060ff",
+  2: "#e02020",
+  3: "#d020ff",
+  4: "#20c040",
+  5: "#20d0d0",
+  6: "#f0d020",
+  7: "#f8f8f8",
+};
 
 fs.mkdirSync(publicDir, { recursive: true });
 
@@ -43,25 +56,10 @@ fs.writeFileSync(path.join(publicDir, "icons", "icon-512.png"), createIconPng(51
 
 function createIconPng(size) {
   const data = Buffer.alloc(size * size * 4);
-  const scale = size / 512;
-
-  fillRect(data, size, 0, 0, size, size, "#050807");
-  fillRect(data, size, 64 * scale, 32 * scale, 384 * scale, 448 * scale, "#202226");
-  fillRect(data, size, 96 * scale, 64 * scale, 320 * scale, 384 * scale, "#050807");
-  fillRect(data, size, 96 * scale, 64 * scale, 12 * scale, 384 * scale, "#78ff70");
-  fillRect(data, size, 404 * scale, 64 * scale, 12 * scale, 384 * scale, "#78ff70");
-  fillRect(data, size, 96 * scale, 64 * scale, 320 * scale, 12 * scale, "#78ff70");
-  fillRect(data, size, 96 * scale, 436 * scale, 320 * scale, 12 * scale, "#78ff70");
-  fillRect(data, size, 176 * scale, 64 * scale, 20 * scale, 384 * scale, "#f2f2f2");
-  fillRect(data, size, 316 * scale, 64 * scale, 20 * scale, 384 * scale, "#f2f2f2");
-  fillRect(data, size, 208 * scale, 64 * scale, 96 * scale, 384 * scale, "#050807");
-  fillRect(data, size, 247 * scale, 104 * scale, 18 * scale, 48 * scale, "#ffd95c");
-  fillRect(data, size, 247 * scale, 200 * scale, 18 * scale, 48 * scale, "#ffd95c");
-  fillRect(data, size, 247 * scale, 296 * scale, 18 * scale, 48 * scale, "#ffd95c");
-  fillRect(data, size, 176 * scale, 352 * scale, 160 * scale, 56 * scale, "#78ff70");
-  fillRect(data, size, 204 * scale, 276 * scale, 104 * scale, 76 * scale, "#58e7ff");
-  fillRect(data, size, 184 * scale, 352 * scale, 144 * scale, 12 * scale, "#050807");
-  fillRect(data, size, 204 * scale, 276 * scale, 104 * scale, 12 * scale, "#050807");
+  const pixel = size / 8;
+  for (const { x, y, color } of iconPixels()) {
+    fillRect(data, size, x * pixel, y * pixel, pixel, pixel, color);
+  }
 
   const scanlines = Buffer.alloc(size * (size * 4 + 1));
   for (let y = 0; y < size; y++) {
@@ -80,6 +78,35 @@ function createIconPng(size) {
     pngChunk("IDAT", zlib.deflateSync(scanlines)),
     pngChunk("IEND", Buffer.alloc(0))
   ]);
+}
+
+function iconPixels() {
+  const source = fs.readFileSync(basSourcePath, "utf8");
+  for (const [, code, hexData] of source.matchAll(defchrPattern)) {
+    if (Number(code) === iconCharacterCode) {
+      const bytes = Buffer.from(hexData, "hex");
+      if (bytes.length !== 24) {
+        throw new Error(`DEFCHR$(${iconCharacterCode}) has ${bytes.length} bytes, expected 24`);
+      }
+      const pixels = [];
+      for (let y = 0; y < 8; y++) {
+        for (let x = 0; x < 8; x++) {
+          const color = defchrPixelColor(bytes, x, y);
+          if (color) pixels.push({ x: 7 - y, y: x, color });
+        }
+      }
+      return pixels;
+    }
+  }
+  throw new Error(`DEFCHR$(${iconCharacterCode}) was not found`);
+}
+
+function defchrPixelColor(bytes, x, y) {
+  const mask = 1 << (7 - y);
+  const blue = bytes[x] & mask ? 1 : 0;
+  const red = bytes[8 + x] & mask ? 2 : 0;
+  const green = bytes[16 + x] & mask ? 4 : 0;
+  return defchrColors[blue | red | green];
 }
 
 function fillRect(data, size, x, y, width, height, color) {

@@ -14,7 +14,7 @@ const START_DECAY_TONE_HZ = 880;
 const START_DECAY_TONE_PERIOD = Math.round(PSG_CLOCK_HZ / (16 * START_DECAY_TONE_HZ));
 const START_DECAY_MS = 1_200;
 const START_DECAY_ENVELOPE_PERIOD = Math.round((START_DECAY_MS / 1_000) * PSG_CLOCK_HZ / 4_096);
-const ENGINE_REV_STEP_MS = 18;
+const ENGINE_REV_STEP_MS = 10;
 const CRASH_EFFECT_MS = 900;
 const CRASH_EFFECT_FRAME_MS = 70;
 const CUSTOM = new Set([224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235]);
@@ -25,10 +25,12 @@ const TITLE_TEXT = "HIGH DRIVE";
 const TITLE_PROMPT_X = 9;
 const TITLE_PROMPT_Y = 15;
 const TITLE_PROMPT = "HIT ANY KEY";
+const TITLE_WALL_Y = TITLE_PROMPT_Y - 2;
+const CREDIT_URL = "https://github.com/mazfuji/high_drive";
 const NS = "http://www.w3.org/2000/svg";
 const XLINK = "http://www.w3.org/1999/xlink";
 
-type GameMode = "title" | "play" | "over" | "bonus_count";
+type GameMode = "title" | "play" | "over" | "bonus_count" | "credits";
 type CellBuffer = { code: number; color: string; filter?: string };
 type NoteName = "C" | "D" | "E" | "F" | "G" | "A" | "B";
 type PlayNote = { name: NoteName; octave: number; accidental: number };
@@ -38,6 +40,7 @@ const screen = document.querySelector<SVGSVGElement>("#screen")!;
 const cabinet = document.querySelector(".cabinet") as HTMLElement;
 const fullscreenButton = document.getElementById("fullscreenButton") as HTMLButtonElement;
 const cells: SVGUseElement[] = [];
+let creditLink: SVGAElement | null = null;
 let psg: PsgPlayer | null = null;
 let soundToken = 0;
 let soundBlockingToken = 0;
@@ -338,7 +341,8 @@ async function playStartSoundCue(token: number): Promise<void> {
   await psg?.play(75);
   await psg?.play("O4A1R5A1R5A1R5");
   if (soundToken !== token) return;
-  preparePlayfield();
+  clearTitleWall();
+  render();
   const releaseSoundBlock = blockSoundProcessing();
   try {
     sound(0, START_DECAY_TONE_PERIOD & 0xff);
@@ -353,6 +357,7 @@ async function playStartSoundCue(token: number): Promise<void> {
     releaseSoundBlock();
   }
   if (soundToken !== token) return;
+  preparePlayfield();
   await playEngineRevUp(token);
   if (soundToken === token) engineSound();
 }
@@ -434,6 +439,25 @@ function makeScreen(): void {
       cells.push(use);
     }
   }
+
+  creditLink = document.createElementNS(NS, "a");
+  creditLink.setAttribute("href", CREDIT_URL);
+  creditLink.setAttributeNS(XLINK, "href", CREDIT_URL);
+  creditLink.setAttribute("target", "_blank");
+  creditLink.setAttribute("rel", "noopener noreferrer");
+  creditLink.style.display = "none";
+
+  const creditText = document.createElementNS(NS, "text");
+  creditText.setAttribute("x", String(roadMin() * CELL));
+  creditText.setAttribute("y", String(21 * CELL + 7));
+  creditText.setAttribute("textLength", String(ROAD_SPACES * CELL));
+  creditText.setAttribute("lengthAdjust", "spacingAndGlyphs");
+  creditText.setAttribute("font-family", "Arcade8x8ASCII, monospace");
+  creditText.setAttribute("font-size", "5");
+  creditText.setAttribute("fill", COLORS.cyan);
+  creditText.textContent = CREDIT_URL;
+  creditLink.appendChild(creditText);
+  screen.appendChild(creditLink);
 }
 
 function setCell(x: number, y: number, code: number, color = COLORS.main): void {
@@ -471,10 +495,12 @@ function drawRoadRow(y: number, left: number): void {
 
 function title(): void {
   if (psg) psg.mute();
+  hideCreditLink();
   resetGame();
   clearAll();
   clearGameArea();
   printText(TITLE_TEXT_X, TITLE_TEXT_Y, TITLE_TEXT, COLORS.amber);
+  fillRect(TITLE_PROMPT_X, TITLE_WALL_Y, TITLE_PROMPT.length, 1, 231);
   printText(TITLE_PROMPT_X, TITLE_PROMPT_Y, TITLE_PROMPT, COLORS.text);
   setCell(state.playerX, PLAYER_Y, 224);
   drawStatus();
@@ -499,14 +525,49 @@ function resetGame(): void {
   state.delayedHazardToken = 0;
 }
 
+function showCredits(): void {
+  state.mode = "credits";
+  clearAll();
+  clearGameArea();
+  printRoadText(4, "HIGH DRIVE", COLORS.amber);
+  printRoadText(7, "Copyright", COLORS.text);
+  printRoadText(8, "(C) 1984", COLORS.text);
+  printRoadText(11, "Hideshi", COLORS.text);
+  printRoadText(12, "Matsufuji", COLORS.text);
+  showCreditLink();
+  drawStatus();
+  render();
+}
+
+function printRoadText(y: number, text: string, color = COLORS.text): void {
+  const x = roadMin() + Math.floor((ROAD_SPACES - text.length) / 2);
+  printText(x, y, text, color);
+}
+
+function showCreditLink(): void {
+  if (creditLink) creditLink.style.display = "";
+}
+
+function hideCreditLink(): void {
+  if (creditLink) creditLink.style.display = "none";
+}
+
 function startGame(): void {
   state.mode = "play";
   state.tick = 0;
   state.stageTick = 0;
-  fillRect(TITLE_TEXT_X, TITLE_TEXT_Y, TITLE_TEXT.length, 1, 32);
-  fillRect(TITLE_PROMPT_X, TITLE_PROMPT_Y, TITLE_PROMPT.length, 1, 231);
+  clearTitleText();
   render();
   startSoundCue();
+}
+
+function clearTitleText(): void {
+  fillRect(TITLE_TEXT_X, TITLE_TEXT_Y, TITLE_TEXT.length, 1, 32);
+  fillRect(TITLE_PROMPT_X, TITLE_PROMPT_Y, TITLE_PROMPT.length, 1, 32);
+}
+
+function clearTitleWall(): void {
+  fillRect(TITLE_PROMPT_X, TITLE_WALL_Y, TITLE_PROMPT.length, 1, 32);
 }
 
 function preparePlayfield(): void {
@@ -850,8 +911,13 @@ window.addEventListener("keydown", (event) => {
     startGame();
     return;
   }
+  if (state.mode === "credits") {
+    title();
+    return;
+  }
   if (state.mode === "over") {
-    if (event.key === "y" || event.key === "Y" || event.key === "n" || event.key === "N") title();
+    if (event.key === "y" || event.key === "Y") title();
+    if (event.key === "n" || event.key === "N") showCredits();
   }
 });
 

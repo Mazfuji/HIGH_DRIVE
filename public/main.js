@@ -273,7 +273,7 @@ const START_DECAY_TONE_HZ = 880;
 const START_DECAY_TONE_PERIOD = Math.round(PSG_CLOCK_HZ / (16 * START_DECAY_TONE_HZ));
 const START_DECAY_MS = 1200;
 const START_DECAY_ENVELOPE_PERIOD = Math.round((START_DECAY_MS / 1000) * PSG_CLOCK_HZ / 4096);
-const ENGINE_REV_STEP_MS = 18;
+const ENGINE_REV_STEP_MS = 10;
 const CRASH_EFFECT_MS = 900;
 const CRASH_EFFECT_FRAME_MS = 70;
 const CUSTOM = new Set([224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235]);
@@ -284,12 +284,15 @@ const TITLE_TEXT = "HIGH DRIVE";
 const TITLE_PROMPT_X = 9;
 const TITLE_PROMPT_Y = 15;
 const TITLE_PROMPT = "HIT ANY KEY";
+const TITLE_WALL_Y = TITLE_PROMPT_Y - 2;
+const CREDIT_URL = "https://github.com/mazfuji/high_drive";
 const NS = "http://www.w3.org/2000/svg";
 const XLINK = "http://www.w3.org/1999/xlink";
 const screen = document.querySelector("#screen");
 const cabinet = document.querySelector(".cabinet");
 const fullscreenButton = document.getElementById("fullscreenButton");
 const cells = [];
+let creditLink = null;
 let psg = null;
 let soundToken = 0;
 let soundBlockingToken = 0;
@@ -557,7 +560,8 @@ async function playStartSoundCue(token) {
     await psg?.play("O4A1R5A1R5A1R5");
     if (soundToken !== token)
         return;
-    preparePlayfield();
+    clearTitleWall();
+    render();
     const releaseSoundBlock = blockSoundProcessing();
     try {
         sound(0, START_DECAY_TONE_PERIOD & 0xff);
@@ -574,6 +578,7 @@ async function playStartSoundCue(token) {
     }
     if (soundToken !== token)
         return;
+    preparePlayfield();
     await playEngineRevUp(token);
     if (soundToken === token)
         engineSound();
@@ -652,6 +657,23 @@ function makeScreen() {
             cells.push(use);
         }
     }
+    creditLink = document.createElementNS(NS, "a");
+    creditLink.setAttribute("href", CREDIT_URL);
+    creditLink.setAttributeNS(XLINK, "href", CREDIT_URL);
+    creditLink.setAttribute("target", "_blank");
+    creditLink.setAttribute("rel", "noopener noreferrer");
+    creditLink.style.display = "none";
+    const creditText = document.createElementNS(NS, "text");
+    creditText.setAttribute("x", String(roadMin() * CELL));
+    creditText.setAttribute("y", String(21 * CELL + 7));
+    creditText.setAttribute("textLength", String(ROAD_SPACES * CELL));
+    creditText.setAttribute("lengthAdjust", "spacingAndGlyphs");
+    creditText.setAttribute("font-family", "Arcade8x8ASCII, monospace");
+    creditText.setAttribute("font-size", "5");
+    creditText.setAttribute("fill", COLORS.cyan);
+    creditText.textContent = CREDIT_URL;
+    creditLink.appendChild(creditText);
+    screen.appendChild(creditLink);
 }
 function setCell(x, y, code, color = COLORS.main) {
     if (x < 0 || x >= COLS || y < 0 || y >= ROWS)
@@ -689,10 +711,12 @@ function drawRoadRow(y, left) {
 function title() {
     if (psg)
         psg.mute();
+    hideCreditLink();
     resetGame();
     clearAll();
     clearGameArea();
     printText(TITLE_TEXT_X, TITLE_TEXT_Y, TITLE_TEXT, COLORS.amber);
+    fillRect(TITLE_PROMPT_X, TITLE_WALL_Y, TITLE_PROMPT.length, 1, 231);
     printText(TITLE_PROMPT_X, TITLE_PROMPT_Y, TITLE_PROMPT, COLORS.text);
     setCell(state.playerX, PLAYER_Y, 224);
     drawStatus();
@@ -715,14 +739,45 @@ function resetGame() {
     state.bonusRemaining = 0;
     state.delayedHazardToken = 0;
 }
+function showCredits() {
+    state.mode = "credits";
+    clearAll();
+    clearGameArea();
+    printRoadText(4, "HIGH DRIVE", COLORS.amber);
+    printRoadText(7, "Copyright", COLORS.text);
+    printRoadText(8, "(C) 1984", COLORS.text);
+    printRoadText(11, "Hideshi", COLORS.text);
+    printRoadText(12, "Matsufuji", COLORS.text);
+    showCreditLink();
+    drawStatus();
+    render();
+}
+function printRoadText(y, text, color = COLORS.text) {
+    const x = roadMin() + Math.floor((ROAD_SPACES - text.length) / 2);
+    printText(x, y, text, color);
+}
+function showCreditLink() {
+    if (creditLink)
+        creditLink.style.display = "";
+}
+function hideCreditLink() {
+    if (creditLink)
+        creditLink.style.display = "none";
+}
 function startGame() {
     state.mode = "play";
     state.tick = 0;
     state.stageTick = 0;
-    fillRect(TITLE_TEXT_X, TITLE_TEXT_Y, TITLE_TEXT.length, 1, 32);
-    fillRect(TITLE_PROMPT_X, TITLE_PROMPT_Y, TITLE_PROMPT.length, 1, 231);
+    clearTitleText();
     render();
     startSoundCue();
+}
+function clearTitleText() {
+    fillRect(TITLE_TEXT_X, TITLE_TEXT_Y, TITLE_TEXT.length, 1, 32);
+    fillRect(TITLE_PROMPT_X, TITLE_PROMPT_Y, TITLE_PROMPT.length, 1, 32);
+}
+function clearTitleWall() {
+    fillRect(TITLE_PROMPT_X, TITLE_WALL_Y, TITLE_PROMPT.length, 1, 32);
 }
 function preparePlayfield() {
     clearAll();
@@ -1060,9 +1115,15 @@ window.addEventListener("keydown", (event) => {
         startGame();
         return;
     }
+    if (state.mode === "credits") {
+        title();
+        return;
+    }
     if (state.mode === "over") {
-        if (event.key === "y" || event.key === "Y" || event.key === "n" || event.key === "N")
+        if (event.key === "y" || event.key === "Y")
             title();
+        if (event.key === "n" || event.key === "N")
+            showCredits();
     }
 });
 window.addEventListener("keyup", (event) => {
