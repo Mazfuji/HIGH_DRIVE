@@ -267,8 +267,23 @@ const PLAYER_Y = 18;
 const ROAD_SPACES = 11;
 const FRAME_MS = 92;
 const HAZARD_DELAY_MS = FRAME_MS / 2;
+const ORIGINAL_PSG_CLOCK_HZ = 2000000;
+const PSG_CLOCK_HZ = 1789750;
+const START_DECAY_TONE_HZ = 880;
+const START_DECAY_TONE_PERIOD = Math.round(PSG_CLOCK_HZ / (16 * START_DECAY_TONE_HZ));
+const START_DECAY_MS = 1200;
+const START_DECAY_ENVELOPE_PERIOD = Math.round((START_DECAY_MS / 1000) * PSG_CLOCK_HZ / 4096);
+const ENGINE_REV_STEP_MS = 18;
+const CRASH_EFFECT_MS = 900;
+const CRASH_EFFECT_FRAME_MS = 70;
 const CUSTOM = new Set([224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235]);
 const HIGH_SCORE_KEY = "high-drive.high-score";
+const TITLE_TEXT_X = 9;
+const TITLE_TEXT_Y = 6;
+const TITLE_TEXT = "HIGH DRIVE";
+const TITLE_PROMPT_X = 9;
+const TITLE_PROMPT_Y = 15;
+const TITLE_PROMPT = "HIT ANY KEY";
 const NS = "http://www.w3.org/2000/svg";
 const XLINK = "http://www.w3.org/1999/xlink";
 const screen = document.querySelector("#screen");
@@ -277,6 +292,8 @@ const fullscreenButton = document.getElementById("fullscreenButton");
 const cells = [];
 let psg = null;
 let soundToken = 0;
+let soundBlockingToken = 0;
+let soundBlocking = false;
 const COLORS = {
     main: "#78ff70",
     dim: "#227d39",
@@ -286,7 +303,17 @@ const COLORS = {
     red: "#ff5959",
     amber: "#ffd95c",
     cyan: "#58e7ff",
+    magenta: "#ff58ff",
 };
+const BONUS_EFFECT_COLORS = [COLORS.wall, COLORS.amber, COLORS.cyan, COLORS.red, COLORS.main];
+const CRASH_EFFECT_FILTERS = [
+    "brightness(1.8) grayscale(1)",
+    "sepia(1) saturate(8) hue-rotate(350deg) brightness(1.25)",
+    "sepia(1) saturate(9) hue-rotate(145deg) brightness(1.2)",
+    "sepia(1) saturate(10) hue-rotate(315deg) brightness(1.15)",
+    "sepia(1) saturate(9) hue-rotate(55deg) brightness(1.25)",
+];
+const CRASH_FINAL_FILTER = "sepia(1) saturate(10) hue-rotate(250deg) brightness(1.25)";
 const state = {
     mode: "title",
     playerX: 14,
@@ -309,12 +336,16 @@ const state = {
 const buffer = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => ({ code: 32, color: COLORS.main })));
 class PsgPlayer {
     constructor() {
-        this.chip = new AY38910({ clockHz: 1789750, sampleRate: 48000, masterVolume: 0.45 });
+        this.chip = new AY38910({ clockHz: PSG_CLOCK_HZ, sampleRate: 48000, masterVolume: 0.45 });
         this.context = null;
         this.node = null;
         this.playTempo = 120;
-        this.playTimers = [];
+        this.playToken = 0;
+        this.playingMml = false;
         this.toneOffTimers = [null, null, null];
+    }
+    get isPlayingMml() {
+        return this.playingMml;
     }
     async start() {
         if (!this.context) {
@@ -341,7 +372,7 @@ class PsgPlayer {
         this.chip.writeRegister(register, value);
     }
     mute() {
-        this.clearPlayQueue();
+        this.stopPlay();
         for (let ch = 0; ch < this.toneOffTimers.length; ch++) {
             if (this.toneOffTimers[ch] !== null)
                 window.clearTimeout(this.toneOffTimers[ch] ?? undefined);
@@ -367,27 +398,32 @@ class PsgPlayer {
             this.toneOffTimers[channel] = null;
         }, duration * 1000);
     }
-    clearPlayQueue() {
-        for (const timer of this.playTimers)
-            window.clearTimeout(timer);
-        this.playTimers = [];
+    stopPlay() {
+        this.playToken++;
+        this.playingMml = false;
     }
-    play(mmlOrTempo, channel = 1, volume = 13) {
-        void this.start();
+    async play(mmlOrTempo, channel = 1, volume = 13) {
+        await this.start();
         if (typeof mmlOrTempo === "number") {
             this.playTempo = clamp(mmlOrTempo, 32, 5000);
             return;
         }
-        this.clearPlayQueue();
+        const token = ++this.playToken;
+        this.playingMml = true;
         const events = this.parsePlay(mmlOrTempo);
-        let offset = 0;
-        for (const event of events) {
-            if (event.note) {
-                const note = event.note;
-                const duration = Math.max(0.03, event.duration * 0.9);
-                this.playTimers.push(window.setTimeout(() => this.tone(channel, note, duration, volume), offset * 1000));
+        try {
+            for (const event of events) {
+                if (token !== this.playToken)
+                    return;
+                if (event.note) {
+                    this.tone(channel, event.note, Math.max(0.03, event.duration * 0.9), volume);
+                }
+                await sleep(event.duration * 1000);
             }
-            offset += event.duration;
+        }
+        finally {
+            if (token === this.playToken)
+                this.playingMml = false;
         }
     }
     parsePlay(mml) {
@@ -492,59 +528,111 @@ function sound(register, value) {
         return;
     psg.sound(register, value);
 }
+function writeTonePeriodFromOriginalClock(channel, fine, coarse) {
+    const period = ((coarse & 0x0f) << 8) | (fine & 0xff);
+    const converted = convertPeriodFromOriginalClock(period);
+    sound(channel * 2, converted & 0xff);
+    sound(channel * 2 + 1, (converted >> 8) & 0x0f);
+}
+function writeNoisePeriodFromOriginalClock(value) {
+    const period = (value & 0x1f) || 1;
+    sound(6, clamp(convertPeriodFromOriginalClock(period), 1, 0x1f));
+}
+function writeEnvelopePeriodFromOriginalClock(fine, coarse) {
+    const period = ((coarse & 0xff) << 8) | (fine & 0xff);
+    const converted = clamp(convertPeriodFromOriginalClock(period), 1, 0xffff);
+    sound(11, converted & 0xff);
+    sound(12, (converted >> 8) & 0xff);
+}
+function convertPeriodFromOriginalClock(period) {
+    return Math.max(1, Math.round((period * PSG_CLOCK_HZ) / ORIGINAL_PSG_CLOCK_HZ));
+}
 function startSoundCue() {
     ensureSound();
     const token = ++soundToken;
-    psg?.play(60);
-    psg?.play("O4A1R5A1R5A1R5");
-    window.setTimeout(() => {
-        if (soundToken !== token)
-            return;
-        sound(0, 141);
-        sound(1, 0);
+    void playStartSoundCue(token);
+}
+async function playStartSoundCue(token) {
+    await psg?.play(75);
+    await psg?.play("O4A1R5A1R5A1R5");
+    if (soundToken !== token)
+        return;
+    preparePlayfield();
+    const releaseSoundBlock = blockSoundProcessing();
+    try {
+        sound(0, START_DECAY_TONE_PERIOD & 0xff);
+        sound(1, (START_DECAY_TONE_PERIOD >> 8) & 0x0f);
         sound(7, 10);
         sound(8, 31);
-        sound(12, 40);
+        sound(11, START_DECAY_ENVELOPE_PERIOD & 0xff);
+        sound(12, (START_DECAY_ENVELOPE_PERIOD >> 8) & 0xff);
         sound(13, 9);
-    }, 2050);
-    window.setTimeout(() => {
+        await sleep(START_DECAY_MS);
+    }
+    finally {
+        releaseSoundBlock();
+    }
+    if (soundToken !== token)
+        return;
+    await playEngineRevUp(token);
+    if (soundToken === token)
+        engineSound();
+}
+async function playEngineRevUp(token) {
+    const releaseSoundBlock = blockSoundProcessing();
+    try {
+        const targetPitch = currentEnginePitch();
+        for (let pitch = 255; pitch > targetPitch; pitch -= 5) {
+            if (soundToken !== token)
+                return;
+            writeEngineSound(pitch);
+            await sleep(ENGINE_REV_STEP_MS);
+        }
         if (soundToken === token)
-            engineSound();
-    }, 2500);
+            writeEngineSound(targetPitch);
+    }
+    finally {
+        releaseSoundBlock();
+    }
 }
 function engineSound() {
     if (!psg || state.mode !== "play")
         return;
-    const pitch = clamp(210 - state.stage * 6 - Math.abs(state.lastMove) * 20, 40, 255);
-    sound(0, pitch);
-    sound(1, 2);
+    writeEngineSound(currentEnginePitch());
+}
+function currentEnginePitch() {
+    return 40;
+    //return clamp(210 - state.stage * 6 - Math.abs(state.lastMove) * 20, 40, 255);
+}
+function writeEngineSound(pitch) {
+    writeTonePeriodFromOriginalClock(0, pitch, 2);
     sound(7, 10);
     sound(8, 31);
-    sound(12, 1);
+    sound(11, 10);
+    sound(12, 0);
     sound(13, 10);
 }
 function crashSound() {
     ensureSound();
     const token = ++soundToken;
-    sound(0, 180);
-    sound(1, 12);
-    sound(6, 63);
-    sound(7, 17);
+    writeTonePeriodFromOriginalClock(0, 180, 12);
+    writeNoisePeriodFromOriginalClock(63);
+    sound(7, 19);
     sound(8, 31);
-    sound(12, 50);
+    writeEnvelopePeriodFromOriginalClock(0, 5);
     sound(13, 9);
     window.setTimeout(() => {
         if (soundToken === token)
             psg?.mute();
-    }, 900);
+    }, CRASH_EFFECT_MS);
 }
 function bonusSound(big) {
     ensureSound();
-    psg?.play(big ? "O5A0" : "O4A0", 1, 14);
+    void psg?.play(big ? "O5A0" : "O4A0", 1, 14);
 }
 function bonusCountSound() {
     ensureSound();
-    psg?.play("+C1", 1, 10);
+    void psg?.play("+C1", 1, 10);
 }
 function makeScreen() {
     const bg = document.createElementNS(NS, "rect");
@@ -570,6 +658,7 @@ function setCell(x, y, code, color = COLORS.main) {
         return;
     buffer[y][x].code = code;
     buffer[y][x].color = color;
+    buffer[y][x].filter = undefined;
 }
 function printText(x, y, text, color = COLORS.text) {
     for (let i = 0; i < text.length; i++)
@@ -603,8 +692,8 @@ function title() {
     resetGame();
     clearAll();
     clearGameArea();
-    printText(9, 6, "HIGH DRIVE", COLORS.amber);
-    printText(9, 15, "HIT ANY KEY", COLORS.text);
+    printText(TITLE_TEXT_X, TITLE_TEXT_Y, TITLE_TEXT, COLORS.amber);
+    printText(TITLE_PROMPT_X, TITLE_PROMPT_Y, TITLE_PROMPT, COLORS.text);
     setCell(state.playerX, PLAYER_Y, 224);
     drawStatus();
     render();
@@ -630,9 +719,17 @@ function startGame() {
     state.mode = "play";
     state.tick = 0;
     state.stageTick = 0;
+    fillRect(TITLE_TEXT_X, TITLE_TEXT_Y, TITLE_TEXT.length, 1, 32);
+    fillRect(TITLE_PROMPT_X, TITLE_PROMPT_Y, TITLE_PROMPT.length, 1, 231);
+    render();
+    startSoundCue();
+}
+function preparePlayfield() {
     clearAll();
     clearGameArea();
-    startSoundCue();
+    setCell(state.playerX, PLAYER_Y, 224);
+    drawStatus();
+    render();
 }
 function shiftGameDown() {
     for (let y = ROWS - 1; y > 0; y--) {
@@ -746,11 +843,13 @@ function drawStatus() {
     printText(29, 7, "YOUR SCORE", statusColor);
     printText(31, 9, String(state.score).padStart(6, " "), statusColor);
     if (state.stage % 6 === 0)
-        printText(29, 12, "BONUS RODE", statusColor);
+        printText(29, 12, "BONUS ROAD", statusColor);
     else
-        printText(29, 12, "RODE :" + String(state.stage).padStart(4, " "), statusColor);
+        printText(29, 12, "ROAD :" + String(state.stage).padStart(4, " "), statusColor);
 }
 function frame() {
+    if (isSoundProcessingBlocked())
+        return;
     if (state.mode === "bonus_count") {
         updateBonusCount();
         return;
@@ -794,6 +893,10 @@ function frame() {
 function scheduleDelayedHazards(stage, stageTick) {
     const token = ++state.delayedHazardToken;
     window.setTimeout(() => {
+        if (isSoundProcessingBlocked()) {
+            scheduleDelayedHazards(stage, stageTick);
+            return;
+        }
         if (state.mode !== "play")
             return;
         if (state.delayedHazardToken !== token)
@@ -814,7 +917,7 @@ function startBonusCount(amount) {
     state.mode = "bonus_count";
     state.bonusRemaining = amount;
     ensureSound();
-    psg?.play(5000);
+    void psg?.play(5000);
     printBonusCountLabel();
     drawStatus();
     render();
@@ -837,18 +940,38 @@ function updateBonusCount() {
     }
 }
 function printBonusCountLabel() {
-    const colors = [COLORS.wall, COLORS.amber, COLORS.cyan, COLORS.red, COLORS.main];
-    printText(12, 10, "BONUS", colors[state.tick % colors.length]);
+    printText(12, 10, "BONUS", BONUS_EFFECT_COLORS[state.tick % BONUS_EFFECT_COLORS.length]);
     bonusCountSound();
 }
 function crash() {
     state.mode = "over";
     state.flash = 70;
     crashSound();
+    void runCrashEffect();
     drawStatus();
     printText(10, 10, "Try again", COLORS.red);
     printText(9, 12, "[ Y or N ]?", COLORS.red);
     render();
+}
+async function runCrashEffect() {
+    const token = soundToken;
+    const endAt = performance.now() + CRASH_EFFECT_MS;
+    let index = 0;
+    while (soundToken === token && performance.now() < endAt) {
+        const effectIndex = index % BONUS_EFFECT_COLORS.length;
+        setCell(state.playerX, PLAYER_Y + 1, 232);
+        setCell(state.playerX, PLAYER_Y, 224, BONUS_EFFECT_COLORS[effectIndex]);
+        buffer[PLAYER_Y][state.playerX].filter = CRASH_EFFECT_FILTERS[effectIndex];
+        render();
+        index++;
+        await sleep(CRASH_EFFECT_FRAME_MS);
+    }
+    if (soundToken === token) {
+        setCell(state.playerX, PLAYER_Y + 1, 232);
+        setCell(state.playerX, PLAYER_Y, 224, COLORS.magenta);
+        buffer[PLAYER_Y][state.playerX].filter = CRASH_FINAL_FILTER;
+        render();
+    }
 }
 function render() {
     for (let y = 0; y < ROWS; y++) {
@@ -863,6 +986,7 @@ function render() {
             use.setAttributeNS(XLINK, "href", href);
             use.setAttribute("fill", item.color);
             use.style.visibility = code === 32 ? "hidden" : "visible";
+            use.style.filter = item.filter ?? "";
         }
     }
 }
@@ -871,6 +995,20 @@ function clamp(value, min, max) {
 }
 function randInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+function blockSoundProcessing() {
+    const token = ++soundBlockingToken;
+    soundBlocking = true;
+    return () => {
+        if (soundBlockingToken === token)
+            soundBlocking = false;
+    };
+}
+function isSoundProcessingBlocked() {
+    return soundBlocking || Boolean(psg?.isPlayingMml);
+}
+function sleep(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 function loadHighScore() {
     try {
@@ -923,11 +1061,7 @@ window.addEventListener("keydown", (event) => {
         return;
     }
     if (state.mode === "over") {
-        if (event.key === "y" || event.key === "Y") {
-            resetGame();
-            startGame();
-        }
-        if (event.key === "n" || event.key === "N")
+        if (event.key === "y" || event.key === "Y" || event.key === "n" || event.key === "N")
             title();
     }
 });

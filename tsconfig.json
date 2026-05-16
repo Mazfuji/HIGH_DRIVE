@@ -9,7 +9,6 @@
     "skipLibCheck": true
   },
   "include": [
-    "src/**/*.ts",
-    "../AY-3-8910/src/**/*.ts"
+    "src/**/*.ts"
   ]
 }

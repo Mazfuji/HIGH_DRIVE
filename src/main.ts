@@ -1,4 +1,4 @@
-import { AY38910, AYRegister, type AYChannel } from "../../AY-3-8910/src/index";
+import { AY38910, AYRegister, type AYChannel } from "./ay38910";
 
 const COLS = 40;
 const ROWS = 25;
@@ -8,13 +8,28 @@ const PLAYER_Y = 18;
 const ROAD_SPACES = 11;
 const FRAME_MS = 92;
 const HAZARD_DELAY_MS = FRAME_MS / 2;
+const ORIGINAL_PSG_CLOCK_HZ = 2_000_000;
+const PSG_CLOCK_HZ = 1_789_750;
+const START_DECAY_TONE_HZ = 880;
+const START_DECAY_TONE_PERIOD = Math.round(PSG_CLOCK_HZ / (16 * START_DECAY_TONE_HZ));
+const START_DECAY_MS = 1_200;
+const START_DECAY_ENVELOPE_PERIOD = Math.round((START_DECAY_MS / 1_000) * PSG_CLOCK_HZ / 4_096);
+const ENGINE_REV_STEP_MS = 18;
+const CRASH_EFFECT_MS = 900;
+const CRASH_EFFECT_FRAME_MS = 70;
 const CUSTOM = new Set([224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235]);
 const HIGH_SCORE_KEY = "high-drive.high-score";
+const TITLE_TEXT_X = 9;
+const TITLE_TEXT_Y = 6;
+const TITLE_TEXT = "HIGH DRIVE";
+const TITLE_PROMPT_X = 9;
+const TITLE_PROMPT_Y = 15;
+const TITLE_PROMPT = "HIT ANY KEY";
 const NS = "http://www.w3.org/2000/svg";
 const XLINK = "http://www.w3.org/1999/xlink";
 
 type GameMode = "title" | "play" | "over" | "bonus_count";
-type CellBuffer = { code: number; color: string };
+type CellBuffer = { code: number; color: string; filter?: string };
 type NoteName = "C" | "D" | "E" | "F" | "G" | "A" | "B";
 type PlayNote = { name: NoteName; octave: number; accidental: number };
 type PlayEvent = { note?: PlayNote; duration: number };
@@ -25,6 +40,8 @@ const fullscreenButton = document.getElementById("fullscreenButton") as HTMLButt
 const cells: SVGUseElement[] = [];
 let psg: PsgPlayer | null = null;
 let soundToken = 0;
+let soundBlockingToken = 0;
+let soundBlocking = false;
 
 const COLORS = {
   main: "#78ff70",
@@ -35,7 +52,18 @@ const COLORS = {
   red: "#ff5959",
   amber: "#ffd95c",
   cyan: "#58e7ff",
+  magenta: "#ff58ff",
 };
+
+const BONUS_EFFECT_COLORS = [COLORS.wall, COLORS.amber, COLORS.cyan, COLORS.red, COLORS.main];
+const CRASH_EFFECT_FILTERS = [
+  "brightness(1.8) grayscale(1)",
+  "sepia(1) saturate(8) hue-rotate(350deg) brightness(1.25)",
+  "sepia(1) saturate(9) hue-rotate(145deg) brightness(1.2)",
+  "sepia(1) saturate(10) hue-rotate(315deg) brightness(1.15)",
+  "sepia(1) saturate(9) hue-rotate(55deg) brightness(1.25)",
+];
+const CRASH_FINAL_FILTER = "sepia(1) saturate(10) hue-rotate(250deg) brightness(1.25)";
 
 const state: {
   mode: GameMode;
@@ -80,12 +108,17 @@ const buffer: CellBuffer[][] = Array.from({ length: ROWS }, () =>
 );
 
 class PsgPlayer {
-  private readonly chip = new AY38910({ clockHz: 1_789_750, sampleRate: 48_000, masterVolume: 0.45 });
+  private readonly chip = new AY38910({ clockHz: PSG_CLOCK_HZ, sampleRate: 48_000, masterVolume: 0.45 });
   private context: AudioContext | null = null;
   private node: ScriptProcessorNode | null = null;
   private playTempo = 120;
-  private playTimers: number[] = [];
+  private playToken = 0;
+  private playingMml = false;
   private toneOffTimers: Array<number | null> = [null, null, null];
+
+  get isPlayingMml(): boolean {
+    return this.playingMml;
+  }
 
   async start(): Promise<void> {
     if (!this.context) {
@@ -116,7 +149,7 @@ class PsgPlayer {
   }
 
   mute(): void {
-    this.clearPlayQueue();
+    this.stopPlay();
     for (let ch = 0; ch < this.toneOffTimers.length; ch++) {
       if (this.toneOffTimers[ch] !== null) window.clearTimeout(this.toneOffTimers[ch] ?? undefined);
       this.toneOffTimers[ch] = null;
@@ -142,28 +175,31 @@ class PsgPlayer {
     }, duration * 1000);
   }
 
-  clearPlayQueue(): void {
-    for (const timer of this.playTimers) window.clearTimeout(timer);
-    this.playTimers = [];
+  stopPlay(): void {
+    this.playToken++;
+    this.playingMml = false;
   }
 
-  play(mmlOrTempo: string | number, channel: AYChannel = 1, volume = 13): void {
-    void this.start();
+  async play(mmlOrTempo: string | number, channel: AYChannel = 1, volume = 13): Promise<void> {
+    await this.start();
     if (typeof mmlOrTempo === "number") {
       this.playTempo = clamp(mmlOrTempo, 32, 5000);
       return;
     }
 
-    this.clearPlayQueue();
+    const token = ++this.playToken;
+    this.playingMml = true;
     const events = this.parsePlay(mmlOrTempo);
-    let offset = 0;
-    for (const event of events) {
-      if (event.note) {
-        const note = event.note;
-        const duration = Math.max(0.03, event.duration * 0.9);
-        this.playTimers.push(window.setTimeout(() => this.tone(channel, note, duration, volume), offset * 1000));
+    try {
+      for (const event of events) {
+        if (token !== this.playToken) return;
+        if (event.note) {
+          this.tone(channel, event.note, Math.max(0.03, event.duration * 0.9), volume);
+        }
+        await sleep(event.duration * 1000);
       }
-      offset += event.duration;
+    } finally {
+      if (token === this.playToken) this.playingMml = false;
     }
   }
 
@@ -269,59 +305,114 @@ function sound(register: number, value: number): void {
   psg.sound(register, value);
 }
 
+function writeTonePeriodFromOriginalClock(channel: AYChannel, fine: number, coarse: number): void {
+  const period = ((coarse & 0x0f) << 8) | (fine & 0xff);
+  const converted = convertPeriodFromOriginalClock(period);
+  sound(channel * 2, converted & 0xff);
+  sound(channel * 2 + 1, (converted >> 8) & 0x0f);
+}
+
+function writeNoisePeriodFromOriginalClock(value: number): void {
+  const period = (value & 0x1f) || 1;
+  sound(6, clamp(convertPeriodFromOriginalClock(period), 1, 0x1f));
+}
+
+function writeEnvelopePeriodFromOriginalClock(fine: number, coarse: number): void {
+  const period = ((coarse & 0xff) << 8) | (fine & 0xff);
+  const converted = clamp(convertPeriodFromOriginalClock(period), 1, 0xffff);
+  sound(11, converted & 0xff);
+  sound(12, (converted >> 8) & 0xff);
+}
+
+function convertPeriodFromOriginalClock(period: number): number {
+  return Math.max(1, Math.round((period * PSG_CLOCK_HZ) / ORIGINAL_PSG_CLOCK_HZ));
+}
+
 function startSoundCue(): void {
   ensureSound();
   const token = ++soundToken;
-  psg?.play(60);
-  psg?.play("O4A1R5A1R5A1R5");
-  window.setTimeout(() => {
-    if (soundToken !== token) return;
-    sound(0, 141);
-    sound(1, 0);
+  void playStartSoundCue(token);
+}
+
+async function playStartSoundCue(token: number): Promise<void> {
+  await psg?.play(75);
+  await psg?.play("O4A1R5A1R5A1R5");
+  if (soundToken !== token) return;
+  preparePlayfield();
+  const releaseSoundBlock = blockSoundProcessing();
+  try {
+    sound(0, START_DECAY_TONE_PERIOD & 0xff);
+    sound(1, (START_DECAY_TONE_PERIOD >> 8) & 0x0f);
     sound(7, 10);
     sound(8, 31);
-    sound(12, 40);
+    sound(11, START_DECAY_ENVELOPE_PERIOD & 0xff);
+    sound(12, (START_DECAY_ENVELOPE_PERIOD >> 8) & 0xff);
     sound(13, 9);
-  }, 2050);
-  window.setTimeout(() => {
-    if (soundToken === token) engineSound();
-  }, 2500);
+    await sleep(START_DECAY_MS);
+  } finally {
+    releaseSoundBlock();
+  }
+  if (soundToken !== token) return;
+  await playEngineRevUp(token);
+  if (soundToken === token) engineSound();
+}
+
+async function playEngineRevUp(token: number): Promise<void> {
+  const releaseSoundBlock = blockSoundProcessing();
+  try {
+    const targetPitch = currentEnginePitch();
+    for (let pitch = 255; pitch > targetPitch; pitch -= 5) {
+      if (soundToken !== token) return;
+      writeEngineSound(pitch);
+      await sleep(ENGINE_REV_STEP_MS);
+    }
+    if (soundToken === token) writeEngineSound(targetPitch);
+  } finally {
+    releaseSoundBlock();
+  }
 }
 
 function engineSound(): void {
   if (!psg || state.mode !== "play") return;
-  const pitch = clamp(210 - state.stage * 6 - Math.abs(state.lastMove) * 20, 40, 255);
-  sound(0, pitch);
-  sound(1, 2);
+  writeEngineSound(currentEnginePitch());
+}
+
+function currentEnginePitch(): number {
+  return 40;
+  //return clamp(210 - state.stage * 6 - Math.abs(state.lastMove) * 20, 40, 255);
+}
+
+function writeEngineSound(pitch: number): void {
+  writeTonePeriodFromOriginalClock(0, pitch, 2);
   sound(7, 10);
   sound(8, 31);
-  sound(12, 1);
+  sound(11, 10);
+  sound(12, 0);
   sound(13, 10);
 }
 
 function crashSound(): void {
   ensureSound();
   const token = ++soundToken;
-  sound(0, 180);
-  sound(1, 12);
-  sound(6, 63);
-  sound(7, 17);
+  writeTonePeriodFromOriginalClock(0, 180, 12);
+  writeNoisePeriodFromOriginalClock(63);
+  sound(7, 19);
   sound(8, 31);
-  sound(12, 50);
+  writeEnvelopePeriodFromOriginalClock(0, 5);
   sound(13, 9);
   window.setTimeout(() => {
     if (soundToken === token) psg?.mute();
-  }, 900);
+  }, CRASH_EFFECT_MS);
 }
 
 function bonusSound(big: boolean): void {
   ensureSound();
-  psg?.play(big ? "O5A0" : "O4A0", 1, 14);
+  void psg?.play(big ? "O5A0" : "O4A0", 1, 14);
 }
 
 function bonusCountSound(): void {
   ensureSound();
-  psg?.play("+C1", 1, 10);
+  void psg?.play("+C1", 1, 10);
 }
 
 function makeScreen(): void {
@@ -349,6 +440,7 @@ function setCell(x: number, y: number, code: number, color = COLORS.main): void 
   if (x < 0 || x >= COLS || y < 0 || y >= ROWS) return;
   buffer[y][x].code = code;
   buffer[y][x].color = color;
+  buffer[y][x].filter = undefined;
 }
 
 function printText(x: number, y: number, text: string, color = COLORS.text): void {
@@ -382,8 +474,8 @@ function title(): void {
   resetGame();
   clearAll();
   clearGameArea();
-  printText(9, 6, "HIGH DRIVE", COLORS.amber);
-  printText(9, 15, "HIT ANY KEY", COLORS.text);
+  printText(TITLE_TEXT_X, TITLE_TEXT_Y, TITLE_TEXT, COLORS.amber);
+  printText(TITLE_PROMPT_X, TITLE_PROMPT_Y, TITLE_PROMPT, COLORS.text);
   setCell(state.playerX, PLAYER_Y, 224);
   drawStatus();
   render();
@@ -411,9 +503,18 @@ function startGame(): void {
   state.mode = "play";
   state.tick = 0;
   state.stageTick = 0;
+  fillRect(TITLE_TEXT_X, TITLE_TEXT_Y, TITLE_TEXT.length, 1, 32);
+  fillRect(TITLE_PROMPT_X, TITLE_PROMPT_Y, TITLE_PROMPT.length, 1, 231);
+  render();
+  startSoundCue();
+}
+
+function preparePlayfield(): void {
   clearAll();
   clearGameArea();
-  startSoundCue();
+  setCell(state.playerX, PLAYER_Y, 224);
+  drawStatus();
+  render();
 }
 
 function shiftGameDown(): void {
@@ -524,11 +625,12 @@ function drawStatus(): void {
   printText(32, 4, String(state.highScore).padStart(5, " "), statusColor);
   printText(29, 7, "YOUR SCORE", statusColor);
   printText(31, 9, String(state.score).padStart(6, " "), statusColor);
-  if (state.stage % 6 === 0) printText(29, 12, "BONUS RODE", statusColor);
-  else printText(29, 12, "RODE :" + String(state.stage).padStart(4, " "), statusColor);
+  if (state.stage % 6 === 0) printText(29, 12, "BONUS ROAD", statusColor);
+  else printText(29, 12, "ROAD :" + String(state.stage).padStart(4, " "), statusColor);
 }
 
 function frame(): void {
+  if (isSoundProcessingBlocked()) return;
   if (state.mode === "bonus_count") {
     updateBonusCount();
     return;
@@ -572,6 +674,10 @@ function frame(): void {
 function scheduleDelayedHazards(stage: number, stageTick: number): void {
   const token = ++state.delayedHazardToken;
   window.setTimeout(() => {
+    if (isSoundProcessingBlocked()) {
+      scheduleDelayedHazards(stage, stageTick);
+      return;
+    }
     if (state.mode !== "play") return;
     if (state.delayedHazardToken !== token) return;
     if (state.stage !== stage || state.stageTick !== stageTick) return;
@@ -588,7 +694,7 @@ function startBonusCount(amount: number): void {
   state.mode = "bonus_count";
   state.bonusRemaining = amount;
   ensureSound();
-  psg?.play(5000);
+  void psg?.play(5000);
   printBonusCountLabel();
   drawStatus();
   render();
@@ -613,8 +719,7 @@ function updateBonusCount(): void {
 }
 
 function printBonusCountLabel(): void {
-  const colors = [COLORS.wall, COLORS.amber, COLORS.cyan, COLORS.red, COLORS.main];
-  printText(12, 10, "BONUS", colors[state.tick % colors.length]);
+  printText(12, 10, "BONUS", BONUS_EFFECT_COLORS[state.tick % BONUS_EFFECT_COLORS.length]);
   bonusCountSound();
 }
 
@@ -622,10 +727,32 @@ function crash(): void {
   state.mode = "over";
   state.flash = 70;
   crashSound();
+  void runCrashEffect();
   drawStatus();
   printText(10, 10, "Try again", COLORS.red);
   printText(9, 12, "[ Y or N ]?", COLORS.red);
   render();
+}
+
+async function runCrashEffect(): Promise<void> {
+  const token = soundToken;
+  const endAt = performance.now() + CRASH_EFFECT_MS;
+  let index = 0;
+  while (soundToken === token && performance.now() < endAt) {
+    const effectIndex = index % BONUS_EFFECT_COLORS.length;
+    setCell(state.playerX, PLAYER_Y + 1, 232);
+    setCell(state.playerX, PLAYER_Y, 224, BONUS_EFFECT_COLORS[effectIndex]);
+    buffer[PLAYER_Y][state.playerX].filter = CRASH_EFFECT_FILTERS[effectIndex];
+    render();
+    index++;
+    await sleep(CRASH_EFFECT_FRAME_MS);
+  }
+  if (soundToken === token) {
+    setCell(state.playerX, PLAYER_Y + 1, 232);
+    setCell(state.playerX, PLAYER_Y, 224, COLORS.magenta);
+    buffer[PLAYER_Y][state.playerX].filter = CRASH_FINAL_FILTER;
+    render();
+  }
 }
 
 function render(): void {
@@ -641,6 +768,7 @@ function render(): void {
       use.setAttributeNS(XLINK, "href", href);
       use.setAttribute("fill", item.color);
       use.style.visibility = code === 32 ? "hidden" : "visible";
+      use.style.filter = item.filter ?? "";
     }
   }
 }
@@ -651,6 +779,22 @@ function clamp(value: number, min: number, max: number): number {
 
 function randInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function blockSoundProcessing(): () => void {
+  const token = ++soundBlockingToken;
+  soundBlocking = true;
+  return () => {
+    if (soundBlockingToken === token) soundBlocking = false;
+  };
+}
+
+function isSoundProcessingBlocked(): boolean {
+  return soundBlocking || Boolean(psg?.isPlayingMml);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function loadHighScore(): number {
@@ -707,11 +851,7 @@ window.addEventListener("keydown", (event) => {
     return;
   }
   if (state.mode === "over") {
-    if (event.key === "y" || event.key === "Y") {
-      resetGame();
-      startGame();
-    }
-    if (event.key === "n" || event.key === "N") title();
+    if (event.key === "y" || event.key === "Y" || event.key === "n" || event.key === "N") title();
   }
 });
 

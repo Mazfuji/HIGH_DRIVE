@@ -10,7 +10,8 @@
 - `public/` - ビルド後の Firebase Hosting 公開用ファイル
 - `public/arcade_8x8_ascii_font.svg` - ASCII 8x8 SVG フォント
 - `public/high_drive_defchr.svg` - `DEFCHR$` から生成した独自キャラクタ SVG
-- `tools/build.mjs` - `src` と `../AY-3-8910/src/ay38910.ts` から `public` を生成するビルドスクリプト
+- `src/ay38910.ts` - AY-3-8910 PSG エミュレータ
+- `tools/build.mjs` - `src` から `public` を生成するビルドスクリプト
 - `firebase.json` - Firebase Hosting 設定
 
 ## 動作環境
