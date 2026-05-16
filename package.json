@@ -1,0 +1,13 @@
+{
+  "name": "high-drive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm run typecheck && node tools/build.mjs",
+    "typecheck": "node ../AY-3-8910/node_modules/typescript/bin/tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "file:../AY-3-8910/node_modules/typescript"
+  }
+}

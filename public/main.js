@@ -1,0 +1,944 @@
+"use strict";
+var AYRegister;
+(function (AYRegister) {
+    AYRegister[AYRegister["ToneAFine"] = 0] = "ToneAFine";
+    AYRegister[AYRegister["ToneACoarse"] = 1] = "ToneACoarse";
+    AYRegister[AYRegister["ToneBFine"] = 2] = "ToneBFine";
+    AYRegister[AYRegister["ToneBCoarse"] = 3] = "ToneBCoarse";
+    AYRegister[AYRegister["ToneCFine"] = 4] = "ToneCFine";
+    AYRegister[AYRegister["ToneCCoarse"] = 5] = "ToneCCoarse";
+    AYRegister[AYRegister["NoisePeriod"] = 6] = "NoisePeriod";
+    AYRegister[AYRegister["Mixer"] = 7] = "Mixer";
+    AYRegister[AYRegister["VolumeA"] = 8] = "VolumeA";
+    AYRegister[AYRegister["VolumeB"] = 9] = "VolumeB";
+    AYRegister[AYRegister["VolumeC"] = 10] = "VolumeC";
+    AYRegister[AYRegister["EnvelopeFine"] = 11] = "EnvelopeFine";
+    AYRegister[AYRegister["EnvelopeCoarse"] = 12] = "EnvelopeCoarse";
+    AYRegister[AYRegister["EnvelopeShape"] = 13] = "EnvelopeShape";
+    AYRegister[AYRegister["PortA"] = 14] = "PortA";
+    AYRegister[AYRegister["PortB"] = 15] = "PortB";
+})(AYRegister || (AYRegister = {}));
+const REGISTER_COUNT = 16;
+const DEFAULT_CLOCK_HZ = 1789772.5;
+const DEFAULT_SAMPLE_RATE = 48000;
+const DEFAULT_PAN = [
+    { left: 1.0, right: 0.35 },
+    { left: 0.7, right: 0.7 },
+    { left: 0.35, right: 1.0 }
+];
+// Normalized approximation of the AY/YM logarithmic volume ladder.
+const VOLUME_TABLE = [
+    0.0, 0.004, 0.006, 0.009, 0.013, 0.020, 0.030, 0.045,
+    0.067, 0.100, 0.149, 0.223, 0.333, 0.500, 0.749, 1.0
+];
+class AY38910 {
+    constructor(options = {}) {
+        this.registers = new Uint8Array(REGISTER_COUNT);
+        this.tonePhase = [0, 0, 0];
+        this.noisePhase = 0;
+        this.noiseOutput = 1;
+        this.lfsr = 0x1ffff;
+        this.envelopePhase = 0;
+        this.envelopeStep = 0;
+        this.envelopeAlternatePhase = false;
+        this.envelopeHolding = false;
+        this.selectedRegister = 0;
+        this.clockHz = options.clockHz ?? DEFAULT_CLOCK_HZ;
+        this.sampleRate = options.sampleRate ?? DEFAULT_SAMPLE_RATE;
+        this.masterVolume = options.masterVolume ?? 0.25;
+        this.pan = options.pan ?? DEFAULT_PAN.map((entry) => ({ ...entry }));
+    }
+    reset() {
+        this.registers.fill(0);
+        this.tonePhase = [0, 0, 0];
+        this.noisePhase = 0;
+        this.noiseOutput = 1;
+        this.lfsr = 0x1ffff;
+        this.envelopePhase = 0;
+        this.envelopeStep = 0;
+        this.envelopeAlternatePhase = false;
+        this.envelopeHolding = false;
+        this.selectedRegister = 0;
+    }
+    selectRegister(register) {
+        this.selectedRegister = register & 0x0f;
+    }
+    writeSelected(value) {
+        this.writeRegister(this.selectedRegister, value);
+    }
+    readSelected() {
+        return this.readRegister(this.selectedRegister);
+    }
+    writeRegister(register, value) {
+        const index = register & 0x0f;
+        const masked = this.maskRegisterValue(index, value);
+        this.registers[index] = masked;
+        if (index === AYRegister.EnvelopeShape) {
+            this.resetEnvelope();
+        }
+    }
+    readRegister(register) {
+        return this.registers[register & 0x0f];
+    }
+    setTonePeriod(channel, period) {
+        const fine = channel * 2;
+        this.writeRegister(fine, period & 0xff);
+        this.writeRegister(fine + 1, (period >> 8) & 0x0f);
+    }
+    setToneFrequency(channel, frequencyHz) {
+        if (frequencyHz <= 0) {
+            this.setTonePeriod(channel, 0);
+            return;
+        }
+        const period = Math.max(1, Math.min(0x0fff, Math.round(this.clockHz / (16 * frequencyHz))));
+        this.setTonePeriod(channel, period);
+    }
+    setNoisePeriod(period) {
+        this.writeRegister(AYRegister.NoisePeriod, period & 0x1f);
+    }
+    setMixer(options) {
+        let mixer = this.readRegister(AYRegister.Mixer);
+        const flags = [
+            options.toneA, options.toneB, options.toneC,
+            options.noiseA, options.noiseB, options.noiseC
+        ];
+        flags.forEach((enabled, bit) => {
+            if (enabled === undefined)
+                return;
+            mixer = enabled ? mixer & ~(1 << bit) : mixer | (1 << bit);
+        });
+        this.writeRegister(AYRegister.Mixer, mixer);
+    }
+    setVolume(channel, volume, useEnvelope = false) {
+        const clamped = Math.max(0, Math.min(15, Math.round(volume)));
+        this.writeRegister(AYRegister.VolumeA + channel, clamped | (useEnvelope ? 0x10 : 0));
+    }
+    setEnvelope(period, shape) {
+        this.writeRegister(AYRegister.EnvelopeFine, period & 0xff);
+        this.writeRegister(AYRegister.EnvelopeCoarse, (period >> 8) & 0xff);
+        this.writeRegister(AYRegister.EnvelopeShape, shape & 0x0f);
+    }
+    generateMono(target, offset = 0, length = target.length - offset) {
+        for (let i = 0; i < length; i += 1) {
+            const levels = this.nextChannelLevels();
+            target[offset + i] = (levels.a + levels.b + levels.c) / 3;
+        }
+        return target;
+    }
+    generateStereo(left, right, offset = 0, length = Math.min(left.length, right.length) - offset) {
+        for (let i = 0; i < length; i += 1) {
+            const levels = this.nextChannelLevels();
+            const frameLeft = levels.a * this.pan[0].left + levels.b * this.pan[1].left + levels.c * this.pan[2].left;
+            const frameRight = levels.a * this.pan[0].right + levels.b * this.pan[1].right + levels.c * this.pan[2].right;
+            left[offset + i] = frameLeft / 3;
+            right[offset + i] = frameRight / 3;
+        }
+    }
+    nextSample() {
+        const levels = this.nextChannelLevels();
+        return (levels.a + levels.b + levels.c) / 3;
+    }
+    nextChannelLevels() {
+        this.advanceNoise();
+        this.advanceEnvelope();
+        return {
+            a: this.renderChannel(0),
+            b: this.renderChannel(1),
+            c: this.renderChannel(2)
+        };
+    }
+    renderChannel(channel) {
+        const mixer = this.readRegister(AYRegister.Mixer);
+        const toneEnabled = (mixer & (1 << channel)) === 0;
+        const noiseEnabled = (mixer & (1 << (channel + 3))) === 0;
+        const tone = toneEnabled ? this.advanceTone(channel) : 1;
+        const noise = noiseEnabled ? this.noiseOutput : 1;
+        const gate = tone & noise;
+        const volumeIndex = this.getVolumeIndex(channel);
+        return gate === 1 ? VOLUME_TABLE[volumeIndex] * this.masterVolume : 0;
+    }
+    advanceTone(channel) {
+        const period = this.getTonePeriod(channel);
+        const frequency = this.clockHz / (16 * period);
+        this.tonePhase[channel] = (this.tonePhase[channel] + frequency / this.sampleRate) % 1;
+        return this.tonePhase[channel] < 0.5 ? 1 : 0;
+    }
+    advanceNoise() {
+        const period = this.getNoisePeriod();
+        const frequency = this.clockHz / (16 * period);
+        this.noisePhase += frequency / this.sampleRate;
+        while (this.noisePhase >= 1) {
+            this.noisePhase -= 1;
+            const feedback = (this.lfsr ^ (this.lfsr >> 3)) & 1;
+            this.lfsr = (this.lfsr >> 1) | (feedback << 16);
+            this.noiseOutput = this.lfsr & 1;
+        }
+    }
+    advanceEnvelope() {
+        if (this.envelopeHolding)
+            return;
+        const period = this.getEnvelopePeriod();
+        const frequency = this.clockHz / (256 * period);
+        this.envelopePhase += frequency / this.sampleRate;
+        while (this.envelopePhase >= 1 && !this.envelopeHolding) {
+            this.envelopePhase -= 1;
+            this.envelopeStep += 1;
+            if (this.envelopeStep >= 16) {
+                this.handleEnvelopeCycleEnd();
+            }
+        }
+    }
+    handleEnvelopeCycleEnd() {
+        const shape = this.readRegister(AYRegister.EnvelopeShape);
+        const continueFlag = (shape & 0x08) !== 0;
+        const alternate = (shape & 0x02) !== 0;
+        const hold = (shape & 0x01) !== 0;
+        if (!continueFlag) {
+            const attack = this.getEnvelopeAttack();
+            this.envelopeStep = attack ? 0 : 15;
+            this.envelopeHolding = true;
+            return;
+        }
+        if (alternate) {
+            this.envelopeAlternatePhase = !this.envelopeAlternatePhase;
+        }
+        if (hold) {
+            this.envelopeStep = 15;
+            this.envelopeHolding = true;
+            return;
+        }
+        this.envelopeStep = 0;
+    }
+    getVolumeIndex(channel) {
+        const volumeRegister = this.readRegister(AYRegister.VolumeA + channel);
+        if ((volumeRegister & 0x10) === 0) {
+            return volumeRegister & 0x0f;
+        }
+        const attack = this.getEnvelopeAttack();
+        return attack ? this.envelopeStep : 15 - this.envelopeStep;
+    }
+    resetEnvelope() {
+        this.envelopePhase = 0;
+        this.envelopeStep = 0;
+        this.envelopeAlternatePhase = false;
+        this.envelopeHolding = false;
+    }
+    getEnvelopeAttack() {
+        const attack = (this.readRegister(AYRegister.EnvelopeShape) & 0x04) !== 0;
+        return this.envelopeAlternatePhase ? !attack : attack;
+    }
+    getTonePeriod(channel) {
+        const fine = this.readRegister(channel * 2);
+        const coarse = this.readRegister(channel * 2 + 1) & 0x0f;
+        return ((coarse << 8) | fine) || 1;
+    }
+    getNoisePeriod() {
+        return (this.readRegister(AYRegister.NoisePeriod) & 0x1f) || 1;
+    }
+    getEnvelopePeriod() {
+        const fine = this.readRegister(AYRegister.EnvelopeFine);
+        const coarse = this.readRegister(AYRegister.EnvelopeCoarse);
+        return ((coarse << 8) | fine) || 1;
+    }
+    maskRegisterValue(register, value) {
+        const byte = value & 0xff;
+        switch (register) {
+            case AYRegister.ToneACoarse:
+            case AYRegister.ToneBCoarse:
+            case AYRegister.ToneCCoarse:
+            case AYRegister.EnvelopeShape:
+                return byte & 0x0f;
+            case AYRegister.NoisePeriod:
+                return byte & 0x1f;
+            case AYRegister.VolumeA:
+            case AYRegister.VolumeB:
+            case AYRegister.VolumeC:
+                return byte & 0x1f;
+            default:
+                return byte;
+        }
+    }
+}
+const COLS = 40;
+const ROWS = 25;
+const GAME_COLS = 29;
+const CELL = 8;
+const PLAYER_Y = 18;
+const ROAD_SPACES = 11;
+const FRAME_MS = 92;
+const HAZARD_DELAY_MS = FRAME_MS / 2;
+const CUSTOM = new Set([224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235]);
+const HIGH_SCORE_KEY = "high-drive.high-score";
+const NS = "http://www.w3.org/2000/svg";
+const XLINK = "http://www.w3.org/1999/xlink";
+const screen = document.querySelector("#screen");
+const cabinet = document.querySelector(".cabinet");
+const fullscreenButton = document.getElementById("fullscreenButton");
+const cells = [];
+let psg = null;
+let soundToken = 0;
+const COLORS = {
+    main: "#78ff70",
+    dim: "#227d39",
+    wall: "#f2f2f2",
+    road: "#050807",
+    text: "#78ff70",
+    red: "#ff5959",
+    amber: "#ffd95c",
+    cyan: "#58e7ff",
+};
+const state = {
+    mode: "title",
+    playerX: 14,
+    shadowX: 14,
+    roadLeft: 8,
+    score: 0,
+    highScore: loadHighScore(),
+    stage: 1,
+    tick: 0,
+    stageTick: 0,
+    lastMove: 0,
+    keys: new Set(),
+    chase: null,
+    iceGap: 9,
+    barrel: null,
+    flash: 0,
+    bonusRemaining: 0,
+    delayedHazardToken: 0,
+};
+const buffer = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => ({ code: 32, color: COLORS.main })));
+class PsgPlayer {
+    constructor() {
+        this.chip = new AY38910({ clockHz: 1789750, sampleRate: 48000, masterVolume: 0.45 });
+        this.context = null;
+        this.node = null;
+        this.playTempo = 120;
+        this.playTimers = [];
+        this.toneOffTimers = [null, null, null];
+    }
+    async start() {
+        if (!this.context) {
+            const audioWindow = window;
+            const AudioContextCtor = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
+            if (!AudioContextCtor)
+                return;
+            const context = new AudioContextCtor();
+            this.context = context;
+            this.chip.sampleRate = context.sampleRate;
+            this.node = context.createScriptProcessor(1024, 0, 1);
+            this.node.onaudioprocess = (event) => this.process(event.outputBuffer.getChannelData(0));
+            this.node.connect(context.destination);
+            this.mute();
+        }
+        if (this.context.state === "suspended")
+            await this.context.resume();
+    }
+    sound(register, value) {
+        void this.start();
+        this.write(register, value);
+    }
+    write(register, value) {
+        this.chip.writeRegister(register, value);
+    }
+    mute() {
+        this.clearPlayQueue();
+        for (let ch = 0; ch < this.toneOffTimers.length; ch++) {
+            if (this.toneOffTimers[ch] !== null)
+                window.clearTimeout(this.toneOffTimers[ch] ?? undefined);
+            this.toneOffTimers[ch] = null;
+        }
+        this.write(AYRegister.Mixer, 63);
+        this.write(AYRegister.VolumeA, 0);
+        this.write(AYRegister.VolumeB, 0);
+        this.write(AYRegister.VolumeC, 0);
+    }
+    tone(channel, note, duration = 0.08, volume = 12) {
+        void this.start();
+        const semitones = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+        const midi = (note.octave + 1) * 12 + semitones[note.name] + note.accidental;
+        const freq = 440 * 2 ** ((midi - 69) / 12);
+        this.chip.setToneFrequency(channel, freq);
+        this.write(AYRegister.Mixer, 0x3f & ~(1 << channel));
+        this.chip.setVolume(channel, volume);
+        if (this.toneOffTimers[channel] !== null)
+            window.clearTimeout(this.toneOffTimers[channel] ?? undefined);
+        this.toneOffTimers[channel] = window.setTimeout(() => {
+            this.chip.setVolume(channel, 0);
+            this.toneOffTimers[channel] = null;
+        }, duration * 1000);
+    }
+    clearPlayQueue() {
+        for (const timer of this.playTimers)
+            window.clearTimeout(timer);
+        this.playTimers = [];
+    }
+    play(mmlOrTempo, channel = 1, volume = 13) {
+        void this.start();
+        if (typeof mmlOrTempo === "number") {
+            this.playTempo = clamp(mmlOrTempo, 32, 5000);
+            return;
+        }
+        this.clearPlayQueue();
+        const events = this.parsePlay(mmlOrTempo);
+        let offset = 0;
+        for (const event of events) {
+            if (event.note) {
+                const note = event.note;
+                const duration = Math.max(0.03, event.duration * 0.9);
+                this.playTimers.push(window.setTimeout(() => this.tone(channel, note, duration, volume), offset * 1000));
+            }
+            offset += event.duration;
+        }
+    }
+    parsePlay(mml) {
+        const events = [];
+        let octave = 4;
+        let defaultLength = 4;
+        let tempo = this.playTempo;
+        let nextOctaveShift = 0;
+        let i = 0;
+        while (i < mml.length) {
+            const command = mml[i].toUpperCase();
+            i++;
+            if (command === "O") {
+                const number = this.readNumber(mml, i);
+                if (number.text)
+                    octave = clamp(number.value, 0, 8);
+                i = number.index;
+                continue;
+            }
+            if (command === "L") {
+                const number = this.readNumber(mml, i);
+                if (number.text)
+                    defaultLength = clamp(number.value, 1, 64);
+                i = number.index;
+                continue;
+            }
+            if (command === "T") {
+                const number = this.readNumber(mml, i);
+                if (number.text)
+                    tempo = clamp(number.value, 32, 5000);
+                i = number.index;
+                continue;
+            }
+            if (command === ">") {
+                octave = clamp(octave + 1, 0, 8);
+                continue;
+            }
+            if (command === "<") {
+                octave = clamp(octave - 1, 0, 8);
+                continue;
+            }
+            if (command === "+") {
+                nextOctaveShift = 1;
+                continue;
+            }
+            if (command === "-") {
+                nextOctaveShift = -1;
+                continue;
+            }
+            if (!["C", "D", "E", "F", "G", "A", "B", "R"].includes(command))
+                continue;
+            let accidental = 0;
+            if (mml[i] === "+" || mml[i] === "#") {
+                accidental = 1;
+                i++;
+            }
+            else if (mml[i] === "-") {
+                accidental = -1;
+                i++;
+            }
+            const number = this.readNumber(mml, i);
+            i = number.index;
+            const length = number.text ? number.value : defaultLength;
+            const duration = this.playDuration(length, tempo);
+            if (command === "R") {
+                events.push({ duration });
+            }
+            else {
+                events.push({
+                    note: { name: command, octave: clamp(octave + nextOctaveShift, 0, 8), accidental },
+                    duration,
+                });
+            }
+            nextOctaveShift = 0;
+        }
+        return events;
+    }
+    readNumber(text, index) {
+        let end = index;
+        while (end < text.length && /\d/.test(text[end]))
+            end++;
+        const raw = text.slice(index, end);
+        return { text: raw, value: raw ? Number.parseInt(raw, 10) : 0, index: end };
+    }
+    playDuration(length, tempo) {
+        return (60 / tempo) * (Math.max(0, length) + 1) / 8;
+    }
+    process(output) {
+        if (!this.context)
+            return;
+        this.chip.sampleRate = this.context.sampleRate;
+        this.chip.generateMono(output);
+    }
+}
+function ensureSound() {
+    if (!psg)
+        psg = new PsgPlayer();
+    void psg.start();
+}
+function sound(register, value) {
+    if (!psg)
+        return;
+    psg.sound(register, value);
+}
+function startSoundCue() {
+    ensureSound();
+    const token = ++soundToken;
+    psg?.play(60);
+    psg?.play("O4A1R5A1R5A1R5");
+    window.setTimeout(() => {
+        if (soundToken !== token)
+            return;
+        sound(0, 141);
+        sound(1, 0);
+        sound(7, 10);
+        sound(8, 31);
+        sound(12, 40);
+        sound(13, 9);
+    }, 2050);
+    window.setTimeout(() => {
+        if (soundToken === token)
+            engineSound();
+    }, 2500);
+}
+function engineSound() {
+    if (!psg || state.mode !== "play")
+        return;
+    const pitch = clamp(210 - state.stage * 6 - Math.abs(state.lastMove) * 20, 40, 255);
+    sound(0, pitch);
+    sound(1, 2);
+    sound(7, 10);
+    sound(8, 31);
+    sound(12, 1);
+    sound(13, 10);
+}
+function crashSound() {
+    ensureSound();
+    const token = ++soundToken;
+    sound(0, 180);
+    sound(1, 12);
+    sound(6, 63);
+    sound(7, 17);
+    sound(8, 31);
+    sound(12, 50);
+    sound(13, 9);
+    window.setTimeout(() => {
+        if (soundToken === token)
+            psg?.mute();
+    }, 900);
+}
+function bonusSound(big) {
+    ensureSound();
+    psg?.play(big ? "O5A0" : "O4A0", 1, 14);
+}
+function bonusCountSound() {
+    ensureSound();
+    psg?.play("+C1", 1, 10);
+}
+function makeScreen() {
+    const bg = document.createElementNS(NS, "rect");
+    bg.setAttribute("width", "320");
+    bg.setAttribute("height", "200");
+    bg.setAttribute("fill", "#050807");
+    screen.appendChild(bg);
+    for (let y = 0; y < ROWS; y++) {
+        for (let x = 0; x < COLS; x++) {
+            const use = document.createElementNS(NS, "use");
+            use.setAttribute("x", String(x * CELL));
+            use.setAttribute("y", String(y * CELL));
+            use.setAttribute("width", String(CELL));
+            use.setAttribute("height", String(CELL));
+            use.style.imageRendering = "pixelated";
+            screen.appendChild(use);
+            cells.push(use);
+        }
+    }
+}
+function setCell(x, y, code, color = COLORS.main) {
+    if (x < 0 || x >= COLS || y < 0 || y >= ROWS)
+        return;
+    buffer[y][x].code = code;
+    buffer[y][x].color = color;
+}
+function printText(x, y, text, color = COLORS.text) {
+    for (let i = 0; i < text.length; i++)
+        setCell(x + i, y, text.charCodeAt(i), color);
+}
+function fillRect(x, y, w, h, code, color = COLORS.main) {
+    for (let yy = y; yy < y + h; yy++) {
+        for (let xx = x; xx < x + w; xx++)
+            setCell(xx, yy, code, color);
+    }
+}
+function clearAll() {
+    fillRect(0, 0, COLS, ROWS, 32);
+}
+function clearGameArea() {
+    fillRect(0, 0, GAME_COLS, ROWS, 226);
+    for (let y = 0; y < ROWS; y++)
+        drawRoadRow(y, state.roadLeft);
+}
+function drawRoadRow(y, left) {
+    for (let x = 0; x < GAME_COLS; x++)
+        setCell(x, y, 226);
+    setCell(left, y, 228);
+    for (let x = roadMin(); x <= roadMax(); x++)
+        setCell(x, y, 32);
+    setCell(roadRight(), y, 227);
+}
+function title() {
+    if (psg)
+        psg.mute();
+    resetGame();
+    clearAll();
+    clearGameArea();
+    printText(9, 6, "HIGH DRIVE", COLORS.amber);
+    printText(9, 15, "HIT ANY KEY", COLORS.text);
+    setCell(state.playerX, PLAYER_Y, 224);
+    drawStatus();
+    render();
+}
+function resetGame() {
+    state.mode = "title";
+    state.playerX = 14;
+    state.shadowX = 14;
+    state.roadLeft = 8;
+    state.score = 0;
+    state.stage = 1;
+    state.tick = 0;
+    state.stageTick = 0;
+    state.lastMove = 0;
+    state.chase = null;
+    state.iceGap = roadMin();
+    state.barrel = null;
+    state.flash = 0;
+    state.bonusRemaining = 0;
+    state.delayedHazardToken = 0;
+}
+function startGame() {
+    state.mode = "play";
+    state.tick = 0;
+    state.stageTick = 0;
+    clearAll();
+    clearGameArea();
+    startSoundCue();
+}
+function shiftGameDown() {
+    for (let y = ROWS - 1; y > 0; y--) {
+        for (let x = 0; x < GAME_COLS; x++) {
+            buffer[y][x].code = buffer[y - 1][x].code;
+            buffer[y][x].color = buffer[y - 1][x].color;
+        }
+    }
+}
+function spawnTopRow() {
+    const section = currentStage();
+    const loop = Math.floor((state.stage - 1) / 6);
+    drawRoadRow(0, state.roadLeft);
+    if (section === 1 && state.stageTick > 0 && state.stageTick % 10 === 0) {
+        const gap = randInt(roadMin(), roadMax() - 3);
+        for (let x = roadMin(); x <= roadMax(); x++)
+            setCell(x, 0, 231);
+        for (let x = gap; x < gap + 4; x++)
+            setCell(x, 0, 32);
+    }
+    if (section === 2 && Math.random() < Math.min(0.1 + loop * 0.06, 0.34)) {
+        setCell(randInt(roadMin(), roadMax()), 0, 225);
+    }
+    if (section === 3) {
+        state.iceGap = clamp(state.iceGap + randInt(-1, 1), roadMin(), roadMax() - 3);
+        for (let x = roadMin(); x <= roadMax(); x++)
+            setCell(x, 0, 233);
+        for (let x = state.iceGap; x < state.iceGap + 4; x++)
+            setCell(x, 0, 32);
+    }
+    if (section === 4 && Math.random() < 0.15)
+        setCell(randInt(roadMin(), roadMax()), 0, 233);
+    if (section === 4 && state.stageTick > 22 && state.stageTick % 18 === 0) {
+        const x0 = randInt(roadMin(), roadMax() - 4);
+        for (let x = x0; x < x0 + 5; x++)
+            setCell(x, 0, 234);
+    }
+    if (section === 5 && Math.random() < Math.min(0.08 + loop * 0.05, 0.28)) {
+        setCell(randInt(roadMin(), roadMax()), 0, 225);
+    }
+    if (section === 6 && Math.random() < 0.2) {
+        setCell(randInt(roadMin(), roadMax()), 0, Math.random() < 0.12 ? 230 : 229);
+    }
+}
+function updateChaser() {
+    if (currentStage() !== 5)
+        return;
+    if (!state.chase || state.chase.y > 22)
+        state.chase = { x: randInt(roadMin(), roadMax()), y: 0 };
+    const oldX = state.chase.x;
+    const oldY = state.chase.y + 1;
+    state.chase.x = clamp(state.chase.x + randInt(-1, 1), roadMin(), roadMax());
+    state.chase.y += 2;
+    if (buffer[oldY]?.[oldX]?.code === 235)
+        setCell(oldX, oldY, 32);
+    if (state.chase.x === state.playerX && state.chase.y === PLAYER_Y) {
+        crash();
+        return;
+    }
+    if (state.chase.y < ROWS)
+        setCell(state.chase.x, state.chase.y, 235);
+}
+function updateBarrels() {
+    if (currentStage() !== 4)
+        return;
+    for (let y = ROWS - 1; y >= 0; y--) {
+        for (let x = roadMin(); x <= roadMax(); x++) {
+            if (buffer[y][x].code !== 234)
+                continue;
+            setCell(x, y, 32);
+            if (x === state.playerX && y + 1 === PLAYER_Y) {
+                crash();
+                return;
+            }
+            if (y + 1 < ROWS)
+                setCell(x, y + 1, 234);
+        }
+    }
+}
+function updatePlayer() {
+    let move = 0;
+    if (state.keys.has("ArrowLeft") || state.keys.has("KeyA"))
+        move -= 1;
+    if (state.keys.has("ArrowRight") || state.keys.has("KeyD"))
+        move += 1;
+    state.lastMove = move;
+    state.shadowX = state.playerX;
+    const nextX = clamp(state.playerX + move, 1, GAME_COLS - 2);
+    const hit = buffer[PLAYER_Y][nextX].code;
+    if (hit === 229) {
+        state.score += 100;
+        bonusSound(false);
+    }
+    else if (hit === 230) {
+        state.score += 1000;
+        bonusSound(true);
+    }
+    else if (hit !== 32 && hit !== 232) {
+        crash();
+        return;
+    }
+    state.playerX = nextX;
+    setCell(state.shadowX, PLAYER_Y + 1, 232);
+    setCell(state.playerX, PLAYER_Y, 224);
+}
+function drawStatus() {
+    const statusColor = COLORS.wall;
+    fillRect(29, 0, 11, ROWS, 32);
+    printText(29, 2, "HIGH SCORE", statusColor);
+    printText(32, 4, String(state.highScore).padStart(5, " "), statusColor);
+    printText(29, 7, "YOUR SCORE", statusColor);
+    printText(31, 9, String(state.score).padStart(6, " "), statusColor);
+    if (state.stage % 6 === 0)
+        printText(29, 12, "BONUS RODE", statusColor);
+    else
+        printText(29, 12, "RODE :" + String(state.stage).padStart(4, " "), statusColor);
+}
+function frame() {
+    if (state.mode === "bonus_count") {
+        updateBonusCount();
+        return;
+    }
+    if (state.mode !== "play")
+        return;
+    state.tick++;
+    state.stageTick++;
+    state.score++;
+    updateHighScore();
+    const stageAtFrameStart = currentStage();
+    const delayedHazards = stageAtFrameStart === 4 || stageAtFrameStart === 5;
+    shiftGameDown();
+    spawnTopRow();
+    if (!delayedHazards) {
+        updateBarrels();
+        if (state.mode !== "play")
+            return;
+        updateChaser();
+    }
+    updatePlayer();
+    if (state.mode !== "play")
+        return;
+    engineSound();
+    if (state.stageTick >= 200) {
+        const endedBonusStage = currentStage() === 6;
+        state.stage++;
+        state.stageTick = 0;
+        state.chase = null;
+        state.barrel = null;
+        state.iceGap = roadMin();
+        if (endedBonusStage)
+            startBonusCount(Math.floor(state.score / 10));
+    }
+    drawStatus();
+    render();
+    if (delayedHazards && state.mode === "play" && currentStage() === stageAtFrameStart) {
+        scheduleDelayedHazards(state.stage, state.stageTick);
+    }
+}
+function scheduleDelayedHazards(stage, stageTick) {
+    const token = ++state.delayedHazardToken;
+    window.setTimeout(() => {
+        if (state.mode !== "play")
+            return;
+        if (state.delayedHazardToken !== token)
+            return;
+        if (state.stage !== stage || state.stageTick !== stageTick)
+            return;
+        updateBarrels();
+        if (state.mode !== "play")
+            return;
+        updateChaser();
+        if (state.mode !== "play")
+            return;
+        drawStatus();
+        render();
+    }, HAZARD_DELAY_MS);
+}
+function startBonusCount(amount) {
+    state.mode = "bonus_count";
+    state.bonusRemaining = amount;
+    ensureSound();
+    psg?.play(5000);
+    printBonusCountLabel();
+    drawStatus();
+    render();
+}
+function updateBonusCount() {
+    state.tick++;
+    const step = Math.max(1, Math.ceil(state.bonusRemaining / 20));
+    const add = Math.min(step, state.bonusRemaining);
+    state.score += add;
+    state.bonusRemaining -= add;
+    updateHighScore();
+    printBonusCountLabel();
+    drawStatus();
+    render();
+    if (state.bonusRemaining <= 0) {
+        printText(12, 10, "     ", COLORS.main);
+        state.mode = "play";
+        engineSound();
+        render();
+    }
+}
+function printBonusCountLabel() {
+    const colors = [COLORS.wall, COLORS.amber, COLORS.cyan, COLORS.red, COLORS.main];
+    printText(12, 10, "BONUS", colors[state.tick % colors.length]);
+    bonusCountSound();
+}
+function crash() {
+    state.mode = "over";
+    state.flash = 70;
+    crashSound();
+    drawStatus();
+    printText(10, 10, "Try again", COLORS.red);
+    printText(9, 12, "[ Y or N ]?", COLORS.red);
+    render();
+}
+function render() {
+    for (let y = 0; y < ROWS; y++) {
+        for (let x = 0; x < COLS; x++) {
+            const item = buffer[y][x];
+            const use = cells[y * COLS + x];
+            const code = item.code;
+            const href = CUSTOM.has(code)
+                ? `high_drive_defchr.svg#char-${code}`
+                : `arcade_8x8_ascii_font.svg#px-${code >= 32 && code <= 127 ? code : 32}`;
+            use.setAttribute("href", href);
+            use.setAttributeNS(XLINK, "href", href);
+            use.setAttribute("fill", item.color);
+            use.style.visibility = code === 32 ? "hidden" : "visible";
+        }
+    }
+}
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+function randInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+function loadHighScore() {
+    try {
+        const value = Number.parseInt(localStorage.getItem(HIGH_SCORE_KEY) || "", 10);
+        return Number.isFinite(value) && value > 0 ? value : 20000;
+    }
+    catch {
+        return 20000;
+    }
+}
+function updateHighScore() {
+    if (state.score <= state.highScore)
+        return;
+    state.highScore = state.score;
+    try {
+        localStorage.setItem(HIGH_SCORE_KEY, String(state.highScore));
+    }
+    catch {
+        // Ignore storage errors; the in-memory score still updates.
+    }
+}
+function currentStage() {
+    return ((state.stage - 1) % 6) + 1;
+}
+function roadMin() {
+    return state.roadLeft + 1;
+}
+function roadMax() {
+    return state.roadLeft + ROAD_SPACES;
+}
+function roadRight() {
+    return state.roadLeft + ROAD_SPACES + 1;
+}
+function toggleFullscreen() {
+    if (!document.fullscreenElement)
+        void cabinet.requestFullscreen?.();
+    else
+        void document.exitFullscreen?.();
+}
+window.addEventListener("keydown", (event) => {
+    state.keys.add(event.code);
+    if (["ArrowLeft", "ArrowRight", "Space", "KeyA", "KeyD", "KeyF"].includes(event.code))
+        event.preventDefault();
+    if (event.code === "KeyF") {
+        toggleFullscreen();
+        return;
+    }
+    if (state.mode === "title") {
+        startGame();
+        return;
+    }
+    if (state.mode === "over") {
+        if (event.key === "y" || event.key === "Y") {
+            resetGame();
+            startGame();
+        }
+        if (event.key === "n" || event.key === "N")
+            title();
+    }
+});
+window.addEventListener("keyup", (event) => {
+    state.keys.delete(event.code);
+});
+fullscreenButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleFullscreen();
+});
+makeScreen();
+title();
+window.setInterval(frame, FRAME_MS);
+//# sourceMappingURL=main.js.map

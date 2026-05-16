@@ -6,10 +6,11 @@
 ## ファイル構成
 
 - `high_drive.bas` - Hu-BASIC CZ-8CB01 用のゲーム本体
-- `high_drive.html` - ブラウザで遊べるレトロカーアクション版
-- `arcade_8x8_ascii_font.svg` - ASCII 8x8 SVG フォント
-- `high_drive_defchr.svg` - `DEFCHR$` から生成した独自キャラクタ SVG
-- `public/` - Firebase Hosting 公開用ファイル
+- `src/` - ブラウザ版の TypeScript / HTML / CSS ソース
+- `public/` - ビルド後の Firebase Hosting 公開用ファイル
+- `public/arcade_8x8_ascii_font.svg` - ASCII 8x8 SVG フォント
+- `public/high_drive_defchr.svg` - `DEFCHR$` から生成した独自キャラクタ SVG
+- `tools/build.mjs` - `src` と `../AY-3-8910/src/ay38910.ts` から `public` を生成するビルドスクリプト
 - `firebase.json` - Firebase Hosting 設定
 
 ## 動作環境
@@ -29,7 +30,11 @@ RUN
 
 環境によっては、ファイル名や読み込み方法が異なる場合があります。エミュレータを使う場合は、テキスト形式の BASIC プログラムを読み込める形式に変換するか、エミュレータ側の貼り付け・ロード機能を使ってください。
 
-ブラウザ版はローカルサーバーから起動します。
+ブラウザ版は TypeScript をビルドしてから、ローカルサーバーで起動します。
+
+```sh
+npm run build
+```
 
 ```sh
 python3 -m http.server 8000 -d public
