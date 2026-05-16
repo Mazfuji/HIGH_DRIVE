@@ -864,6 +864,12 @@ fullscreenButton.addEventListener("click", (event) => {
   toggleFullscreen();
 });
 
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    void navigator.serviceWorker.register("sw.js");
+  });
+}
+
 makeScreen();
 title();
 window.setInterval(frame, FRAME_MS);
