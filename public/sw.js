@@ -1,9 +1,10 @@
-const CACHE_NAME = "high-drive-v1";
+const CACHE_NAME = "high-drive-v2";
 const ASSETS = [
   "./",
   "./index.html",
   "./style.css",
   "./main.js",
+  "./psg-worklet.js",
   "./arcade_8x8_ascii_font.svg",
   "./high_drive_defchr.svg",
   "./manifest.webmanifest",

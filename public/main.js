@@ -43,6 +43,7 @@ class AY38910 {
         this.envelopeAlternatePhase = false;
         this.envelopeHolding = false;
         this.selectedRegister = 0;
+        this.scratchChannelLevels = [0, 0, 0];
         this.clockHz = options.clockHz ?? DEFAULT_CLOCK_HZ;
         this.sampleRate = options.sampleRate ?? DEFAULT_SAMPLE_RATE;
         this.masterVolume = options.masterVolume ?? 0.25;
@@ -120,35 +121,44 @@ class AY38910 {
     }
     generateMono(target, offset = 0, length = target.length - offset) {
         for (let i = 0; i < length; i += 1) {
-            const levels = this.nextChannelLevels();
-            target[offset + i] = (levels.a + levels.b + levels.c) / 3;
+            target[offset + i] = this.nextMixedSample();
         }
         return target;
     }
     generateStereo(left, right, offset = 0, length = Math.min(left.length, right.length) - offset) {
         for (let i = 0; i < length; i += 1) {
-            const levels = this.nextChannelLevels();
-            const frameLeft = levels.a * this.pan[0].left + levels.b * this.pan[1].left + levels.c * this.pan[2].left;
-            const frameRight = levels.a * this.pan[0].right + levels.b * this.pan[1].right + levels.c * this.pan[2].right;
+            const levels = this.nextRawChannelLevels();
+            const frameLeft = levels[0] * this.pan[0].left + levels[1] * this.pan[1].left + levels[2] * this.pan[2].left;
+            const frameRight = levels[0] * this.pan[0].right + levels[1] * this.pan[1].right + levels[2] * this.pan[2].right;
             left[offset + i] = frameLeft / 3;
             right[offset + i] = frameRight / 3;
         }
     }
     nextSample() {
-        const levels = this.nextChannelLevels();
-        return (levels.a + levels.b + levels.c) / 3;
+        return this.nextMixedSample();
     }
     nextChannelLevels() {
-        this.advanceNoise();
-        this.advanceEnvelope();
+        const levels = this.nextRawChannelLevels();
         return {
-            a: this.renderChannel(0),
-            b: this.renderChannel(1),
-            c: this.renderChannel(2)
+            a: levels[0],
+            b: levels[1],
+            c: levels[2]
         };
     }
-    renderChannel(channel) {
+    nextMixedSample() {
+        const levels = this.nextRawChannelLevels();
+        return (levels[0] + levels[1] + levels[2]) / 3;
+    }
+    nextRawChannelLevels() {
+        this.advanceNoise();
+        this.advanceEnvelope();
         const mixer = this.readRegister(AYRegister.Mixer);
+        this.scratchChannelLevels[0] = this.renderChannel(0, mixer);
+        this.scratchChannelLevels[1] = this.renderChannel(1, mixer);
+        this.scratchChannelLevels[2] = this.renderChannel(2, mixer);
+        return this.scratchChannelLevels;
+    }
+    renderChannel(channel, mixer) {
         const toneEnabled = (mixer & (1 << channel)) === 0;
         const noiseEnabled = (mixer & (1 << (channel + 3))) === 0;
         const tone = toneEnabled ? this.advanceTone(channel) : 1;
@@ -269,6 +279,9 @@ const FRAME_MS = 92;
 const HAZARD_DELAY_MS = FRAME_MS / 2;
 const ORIGINAL_PSG_CLOCK_HZ = 2000000;
 const PSG_CLOCK_HZ = 1789750;
+const PSG_MASTER_VOLUME = 0.45;
+const PSG_WORKLET_URL = "psg-worklet.js";
+const PSG_PROCESSOR_NAME = "psg-processor";
 const START_DECAY_TONE_HZ = 880;
 const START_DECAY_TONE_PERIOD = Math.round(PSG_CLOCK_HZ / (16 * START_DECAY_TONE_HZ));
 const START_DECAY_MS = 1200;
@@ -292,6 +305,7 @@ const screen = document.querySelector("#screen");
 const cabinet = document.querySelector(".cabinet");
 const fullscreenButton = document.getElementById("fullscreenButton");
 const cells = [];
+const renderedCells = [];
 let creditLink = null;
 let psg = null;
 let soundToken = 0;
@@ -339,9 +353,12 @@ const state = {
 const buffer = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => ({ code: 32, color: COLORS.main })));
 class PsgPlayer {
     constructor() {
-        this.chip = new AY38910({ clockHz: PSG_CLOCK_HZ, sampleRate: 48000, masterVolume: 0.45 });
         this.context = null;
-        this.node = null;
+        this.workletNode = null;
+        this.fallbackChip = null;
+        this.fallbackNode = null;
+        this.startPromise = null;
+        this.pendingWrites = [];
         this.playTempo = 120;
         this.playToken = 0;
         this.playingMml = false;
@@ -351,20 +368,22 @@ class PsgPlayer {
         return this.playingMml;
     }
     async start() {
-        if (!this.context) {
-            const audioWindow = window;
-            const AudioContextCtor = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
-            if (!AudioContextCtor)
-                return;
-            const context = new AudioContextCtor();
-            this.context = context;
-            this.chip.sampleRate = context.sampleRate;
-            this.node = context.createScriptProcessor(1024, 0, 1);
-            this.node.onaudioprocess = (event) => this.process(event.outputBuffer.getChannelData(0));
-            this.node.connect(context.destination);
-            this.mute();
+        if (this.startPromise) {
+            await this.startPromise;
+            if (this.context?.state === "suspended")
+                await this.context.resume();
+            return;
         }
-        if (this.context.state === "suspended")
+        if (!this.context) {
+            this.startPromise = this.createContext();
+            try {
+                await this.startPromise;
+            }
+            finally {
+                this.startPromise = null;
+            }
+        }
+        if (this.context?.state === "suspended")
             await this.context.resume();
     }
     sound(register, value) {
@@ -372,7 +391,15 @@ class PsgPlayer {
         this.write(register, value);
     }
     write(register, value) {
-        this.chip.writeRegister(register, value);
+        if (this.workletNode) {
+            this.workletNode.port.postMessage({ type: "write", register, value });
+            return;
+        }
+        if (this.fallbackChip) {
+            this.fallbackChip.writeRegister(register, value);
+            return;
+        }
+        this.pendingWrites.push({ register, value });
     }
     mute() {
         this.stopPlay();
@@ -391,13 +418,13 @@ class PsgPlayer {
         const semitones = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
         const midi = (note.octave + 1) * 12 + semitones[note.name] + note.accidental;
         const freq = 440 * 2 ** ((midi - 69) / 12);
-        this.chip.setToneFrequency(channel, freq);
+        this.setToneFrequency(channel, freq);
         this.write(AYRegister.Mixer, 0x3f & ~(1 << channel));
-        this.chip.setVolume(channel, volume);
+        this.setVolume(channel, volume);
         if (this.toneOffTimers[channel] !== null)
             window.clearTimeout(this.toneOffTimers[channel] ?? undefined);
         this.toneOffTimers[channel] = window.setTimeout(() => {
-            this.chip.setVolume(channel, 0);
+            this.setVolume(channel, 0);
             this.toneOffTimers[channel] = null;
         }, duration * 1000);
     }
@@ -514,11 +541,70 @@ class PsgPlayer {
     playDuration(length, tempo) {
         return (60 / tempo) * (Math.max(0, length) + 1) / 8;
     }
-    process(output) {
-        if (!this.context)
+    async createContext() {
+        const audioWindow = window;
+        const AudioContextCtor = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
+        if (!AudioContextCtor)
             return;
-        this.chip.sampleRate = this.context.sampleRate;
-        this.chip.generateMono(output);
+        const context = new AudioContextCtor();
+        this.context = context;
+        if (context.audioWorklet) {
+            try {
+                await context.audioWorklet.addModule(PSG_WORKLET_URL);
+                this.workletNode = new AudioWorkletNode(context, PSG_PROCESSOR_NAME, {
+                    numberOfInputs: 0,
+                    numberOfOutputs: 1,
+                    outputChannelCount: [1],
+                    processorOptions: {
+                        clockHz: PSG_CLOCK_HZ,
+                        masterVolume: PSG_MASTER_VOLUME,
+                    },
+                });
+                this.workletNode.connect(context.destination);
+                this.flushPendingWrites();
+                return;
+            }
+            catch (error) {
+                console.warn("AudioWorklet unavailable; falling back to ScriptProcessorNode.", error);
+            }
+        }
+        this.fallbackChip = new AY38910({
+            clockHz: PSG_CLOCK_HZ,
+            sampleRate: context.sampleRate,
+            masterVolume: PSG_MASTER_VOLUME,
+        });
+        this.fallbackNode = context.createScriptProcessor(1024, 0, 1);
+        this.fallbackNode.onaudioprocess = (event) => this.process(event.outputBuffer.getChannelData(0));
+        this.fallbackNode.connect(context.destination);
+        this.flushPendingWrites();
+    }
+    flushPendingWrites() {
+        const writes = this.pendingWrites.splice(0);
+        for (const { register, value } of writes)
+            this.write(register, value);
+    }
+    setToneFrequency(channel, frequencyHz) {
+        if (frequencyHz <= 0) {
+            this.setTonePeriod(channel, 0);
+            return;
+        }
+        const period = Math.max(1, Math.min(0x0fff, Math.round(PSG_CLOCK_HZ / (16 * frequencyHz))));
+        this.setTonePeriod(channel, period);
+    }
+    setTonePeriod(channel, period) {
+        const fine = channel * 2;
+        this.write(fine, period & 0xff);
+        this.write(fine + 1, (period >> 8) & 0x0f);
+    }
+    setVolume(channel, volume, useEnvelope = false) {
+        const clamped = Math.max(0, Math.min(15, Math.round(volume)));
+        this.write(AYRegister.VolumeA + channel, clamped | (useEnvelope ? 0x10 : 0));
+    }
+    process(output) {
+        if (!this.context || !this.fallbackChip)
+            return;
+        this.fallbackChip.sampleRate = this.context.sampleRate;
+        this.fallbackChip.generateMono(output);
     }
 }
 function ensureSound() {
@@ -655,6 +741,7 @@ function makeScreen() {
             use.style.imageRendering = "pixelated";
             screen.appendChild(use);
             cells.push(use);
+            renderedCells.push({ href: "", color: "", visibility: "", filter: "" });
         }
     }
     creditLink = document.createElementNS(NS, "a");
@@ -678,9 +765,12 @@ function makeScreen() {
 function setCell(x, y, code, color = COLORS.main) {
     if (x < 0 || x >= COLS || y < 0 || y >= ROWS)
         return;
-    buffer[y][x].code = code;
-    buffer[y][x].color = color;
-    buffer[y][x].filter = undefined;
+    const item = buffer[y][x];
+    if (item.code === code && item.color === color && item.filter === undefined)
+        return;
+    item.code = code;
+    item.color = color;
+    item.filter = undefined;
 }
 function printText(x, y, text, color = COLORS.text) {
     for (let i = 0; i < text.length; i++)
@@ -791,6 +881,7 @@ function shiftGameDown() {
         for (let x = 0; x < GAME_COLS; x++) {
             buffer[y][x].code = buffer[y - 1][x].code;
             buffer[y][x].color = buffer[y - 1][x].color;
+            buffer[y][x].filter = buffer[y - 1][x].filter;
         }
     }
 }
@@ -1032,18 +1123,37 @@ function render() {
     for (let y = 0; y < ROWS; y++) {
         for (let x = 0; x < COLS; x++) {
             const item = buffer[y][x];
-            const use = cells[y * COLS + x];
+            const index = y * COLS + x;
+            const use = cells[index];
+            const rendered = renderedCells[index];
             const code = item.code;
-            const href = CUSTOM.has(code)
-                ? `high_drive_defchr.svg#char-${code}`
-                : `arcade_8x8_ascii_font.svg#px-${code >= 32 && code <= 127 ? code : 32}`;
-            use.setAttribute("href", href);
-            use.setAttributeNS(XLINK, "href", href);
-            use.setAttribute("fill", item.color);
-            use.style.visibility = code === 32 ? "hidden" : "visible";
-            use.style.filter = item.filter ?? "";
+            const href = characterHref(code);
+            const visibility = code === 32 ? "hidden" : "visible";
+            const filter = item.filter ?? "";
+            if (rendered.href !== href) {
+                use.setAttribute("href", href);
+                use.setAttributeNS(XLINK, "href", href);
+                rendered.href = href;
+            }
+            if (rendered.color !== item.color) {
+                use.setAttribute("fill", item.color);
+                rendered.color = item.color;
+            }
+            if (rendered.visibility !== visibility) {
+                use.style.visibility = visibility;
+                rendered.visibility = visibility;
+            }
+            if (rendered.filter !== filter) {
+                use.style.filter = filter;
+                rendered.filter = filter;
+            }
         }
     }
+}
+function characterHref(code) {
+    if (CUSTOM.has(code))
+        return `high_drive_defchr.svg#char-${code}`;
+    return `arcade_8x8_ascii_font.svg#px-${code >= 32 && code <= 127 ? code : 32}`;
 }
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));

@@ -11,6 +11,8 @@ export interface ChannelLevels {
   c: number;
 }
 
+type ChannelLevelTuple = [number, number, number];
+
 export interface AY38910Options {
   clockHz?: number;
   sampleRate?: number;
@@ -69,6 +71,7 @@ export class AY38910 {
   private envelopeAlternatePhase = false;
   private envelopeHolding = false;
   private selectedRegister = 0;
+  private readonly scratchChannelLevels: ChannelLevelTuple = [0, 0, 0];
 
   constructor(options: AY38910Options = {}) {
     this.clockHz = options.clockHz ?? DEFAULT_CLOCK_HZ;
@@ -171,40 +174,51 @@ export class AY38910 {
 
   generateMono(target: Float32Array, offset = 0, length = target.length - offset): Float32Array {
     for (let i = 0; i < length; i += 1) {
-      const levels = this.nextChannelLevels();
-      target[offset + i] = (levels.a + levels.b + levels.c) / 3;
+      target[offset + i] = this.nextMixedSample();
     }
     return target;
   }
 
   generateStereo(left: Float32Array, right: Float32Array, offset = 0, length = Math.min(left.length, right.length) - offset): void {
     for (let i = 0; i < length; i += 1) {
-      const levels = this.nextChannelLevels();
-      const frameLeft = levels.a * this.pan[0].left + levels.b * this.pan[1].left + levels.c * this.pan[2].left;
-      const frameRight = levels.a * this.pan[0].right + levels.b * this.pan[1].right + levels.c * this.pan[2].right;
+      const levels = this.nextRawChannelLevels();
+      const frameLeft = levels[0] * this.pan[0].left + levels[1] * this.pan[1].left + levels[2] * this.pan[2].left;
+      const frameRight = levels[0] * this.pan[0].right + levels[1] * this.pan[1].right + levels[2] * this.pan[2].right;
       left[offset + i] = frameLeft / 3;
       right[offset + i] = frameRight / 3;
     }
   }
 
   nextSample(): number {
-    const levels = this.nextChannelLevels();
-    return (levels.a + levels.b + levels.c) / 3;
+    return this.nextMixedSample();
   }
 
   nextChannelLevels(): ChannelLevels {
-    this.advanceNoise();
-    this.advanceEnvelope();
-
+    const levels = this.nextRawChannelLevels();
     return {
-      a: this.renderChannel(0),
-      b: this.renderChannel(1),
-      c: this.renderChannel(2)
+      a: levels[0],
+      b: levels[1],
+      c: levels[2]
     };
   }
 
-  private renderChannel(channel: AYChannel): number {
+  private nextMixedSample(): number {
+    const levels = this.nextRawChannelLevels();
+    return (levels[0] + levels[1] + levels[2]) / 3;
+  }
+
+  private nextRawChannelLevels(): ChannelLevelTuple {
+    this.advanceNoise();
+    this.advanceEnvelope();
     const mixer = this.readRegister(AYRegister.Mixer);
+
+    this.scratchChannelLevels[0] = this.renderChannel(0, mixer);
+    this.scratchChannelLevels[1] = this.renderChannel(1, mixer);
+    this.scratchChannelLevels[2] = this.renderChannel(2, mixer);
+    return this.scratchChannelLevels;
+  }
+
+  private renderChannel(channel: AYChannel, mixer: number): number {
     const toneEnabled = (mixer & (1 << channel)) === 0;
     const noiseEnabled = (mixer & (1 << (channel + 3))) === 0;
     const tone = toneEnabled ? this.advanceTone(channel) : 1;

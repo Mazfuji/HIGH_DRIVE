@@ -8,6 +8,7 @@ const srcDir = path.join(root, "src");
 const publicDir = path.join(root, "public");
 const aySourcePath = path.join(srcDir, "ay38910.ts");
 const mainSourcePath = path.join(srcDir, "main.ts");
+const workletSourcePath = path.join(srcDir, "psg-worklet.ts");
 const basSourcePath = path.join(root, "high_drive.bas");
 const iconCharacterCode = 224;
 const defchrPattern = /DEFCHR\$\((\d+)\)=HEXCHR\$\("([0-9A-Fa-f]+)"\)/g;
@@ -33,18 +34,18 @@ const mainSource = fs
   .replace(/^import\s+\{[^}]+\}\s+from\s+["']\.\/ay38910["'];\n/, "");
 
 const bundledSource = `${aySource}\n\n${mainSource}`;
-const result = ts.transpileModule(bundledSource, {
-  compilerOptions: {
-    target: ts.ScriptTarget.ES2020,
-    module: ts.ModuleKind.ES2020,
-    strict: true,
-    sourceMap: true,
-  },
-  fileName: "main.ts",
-});
+const result = transpile("main.ts", bundledSource);
 
 fs.writeFileSync(path.join(publicDir, "main.js"), result.outputText);
 fs.writeFileSync(path.join(publicDir, "main.js.map"), result.sourceMapText ?? "");
+
+const workletSource = fs
+  .readFileSync(workletSourcePath, "utf8")
+  .replace(/^import\s+\{[^}]+\}\s+from\s+["']\.\/ay38910["'];\n/, "");
+const workletResult = transpile("psg-worklet.ts", `${aySource}\n\n${workletSource}`);
+
+fs.writeFileSync(path.join(publicDir, "psg-worklet.js"), workletResult.outputText);
+fs.writeFileSync(path.join(publicDir, "psg-worklet.js.map"), workletResult.sourceMapText ?? "");
 fs.copyFileSync(path.join(srcDir, "index.html"), path.join(publicDir, "index.html"));
 fs.copyFileSync(path.join(srcDir, "style.css"), path.join(publicDir, "style.css"));
 fs.copyFileSync(path.join(srcDir, "manifest.webmanifest"), path.join(publicDir, "manifest.webmanifest"));
@@ -53,6 +54,18 @@ fs.mkdirSync(path.join(publicDir, "icons"), { recursive: true });
 fs.copyFileSync(path.join(srcDir, "icons", "icon.svg"), path.join(publicDir, "icons", "icon.svg"));
 fs.writeFileSync(path.join(publicDir, "icons", "icon-192.png"), createIconPng(192));
 fs.writeFileSync(path.join(publicDir, "icons", "icon-512.png"), createIconPng(512));
+
+function transpile(fileName, source) {
+  return ts.transpileModule(source, {
+    compilerOptions: {
+      target: ts.ScriptTarget.ES2020,
+      module: ts.ModuleKind.ES2020,
+      strict: true,
+      sourceMap: true,
+    },
+    fileName,
+  });
+}
 
 function createIconPng(size) {
   const data = Buffer.alloc(size * size * 4);
