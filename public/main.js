@@ -290,6 +290,8 @@ const ENGINE_REV_STEP_MS = 10;
 const CRASH_EFFECT_MS = 900;
 const CRASH_EFFECT_FRAME_MS = 70;
 const CUSTOM = new Set([224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235]);
+const CONTROL_KEYS = new Set(["ArrowLeft", "ArrowRight", "Space", "KeyA", "KeyD", "KeyF"]);
+const HORIZONTAL_KEYS = new Set(["ArrowLeft", "ArrowRight", "KeyA", "KeyD"]);
 const HIGH_SCORE_KEY = "high-drive.high-score";
 const TITLE_TEXT_X = 9;
 const TITLE_TEXT_Y = 6;
@@ -311,6 +313,10 @@ let psg = null;
 let soundToken = 0;
 let soundBlockingToken = 0;
 let soundBlocking = false;
+let loopPreviousTime = performance.now();
+let frameAccumulator = 0;
+let lastFrameTime = loopPreviousTime;
+let pendingDelayedHazards = null;
 const COLORS = {
     main: "#78ff70",
     dim: "#227d39",
@@ -348,7 +354,6 @@ const state = {
     barrel: null,
     flash: 0,
     bonusRemaining: 0,
-    delayedHazardToken: 0,
 };
 const buffer = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => ({ code: 32, color: COLORS.main })));
 class PsgPlayer {
@@ -827,7 +832,7 @@ function resetGame() {
     state.barrel = null;
     state.flash = 0;
     state.bonusRemaining = 0;
-    state.delayedHazardToken = 0;
+    pendingDelayedHazards = null;
 }
 function showCredits() {
     state.mode = "credits";
@@ -993,7 +998,7 @@ function drawStatus() {
     else
         printText(29, 12, "ROAD :" + String(state.stage).padStart(4, " "), statusColor);
 }
-function frame() {
+function frame(now = performance.now()) {
     if (isSoundProcessingBlocked())
         return;
     if (state.mode === "bonus_count") {
@@ -1033,31 +1038,55 @@ function frame() {
     drawStatus();
     render();
     if (delayedHazards && state.mode === "play" && currentStage() === stageAtFrameStart) {
-        scheduleDelayedHazards(state.stage, state.stageTick);
+        scheduleDelayedHazards(state.stage, state.stageTick, now);
     }
 }
-function scheduleDelayedHazards(stage, stageTick) {
-    const token = ++state.delayedHazardToken;
-    window.setTimeout(() => {
-        if (isSoundProcessingBlocked()) {
-            scheduleDelayedHazards(stage, stageTick);
-            return;
-        }
-        if (state.mode !== "play")
-            return;
-        if (state.delayedHazardToken !== token)
-            return;
-        if (state.stage !== stage || state.stageTick !== stageTick)
-            return;
-        updateBarrels();
-        if (state.mode !== "play")
-            return;
-        updateChaser();
-        if (state.mode !== "play")
-            return;
-        drawStatus();
-        render();
-    }, HAZARD_DELAY_MS);
+function gameLoop(now) {
+    processDelayedHazards(now);
+    const elapsed = Math.min(now - loopPreviousTime, FRAME_MS * 2);
+    loopPreviousTime = now;
+    frameAccumulator += elapsed;
+    while (frameAccumulator >= FRAME_MS) {
+        runFrame(now);
+        frameAccumulator -= FRAME_MS;
+    }
+    window.requestAnimationFrame(gameLoop);
+}
+function runFrame(now = performance.now()) {
+    frame(now);
+    lastFrameTime = now;
+}
+function runResponsiveFrame() {
+    if (state.mode !== "play" || isSoundProcessingBlocked())
+        return;
+    const now = performance.now();
+    processDelayedHazards(now);
+    if (now - lastFrameTime < HAZARD_DELAY_MS)
+        return;
+    frameAccumulator = 0;
+    loopPreviousTime = now;
+    runFrame(now);
+}
+function scheduleDelayedHazards(stage, stageTick, now) {
+    pendingDelayedHazards = { stage, stageTick, dueAt: now + HAZARD_DELAY_MS };
+}
+function processDelayedHazards(now) {
+    const pending = pendingDelayedHazards;
+    if (!pending || now < pending.dueAt || isSoundProcessingBlocked())
+        return;
+    pendingDelayedHazards = null;
+    if (state.mode !== "play")
+        return;
+    if (state.stage !== pending.stage || state.stageTick !== pending.stageTick)
+        return;
+    updateBarrels();
+    if (state.mode !== "play")
+        return;
+    updateChaser();
+    if (state.mode !== "play")
+        return;
+    drawStatus();
+    render();
 }
 function startBonusCount(amount) {
     state.mode = "bonus_count";
@@ -1215,7 +1244,7 @@ function toggleFullscreen() {
 }
 window.addEventListener("keydown", (event) => {
     state.keys.add(event.code);
-    if (["ArrowLeft", "ArrowRight", "Space", "KeyA", "KeyD", "KeyF"].includes(event.code))
+    if (CONTROL_KEYS.has(event.code))
         event.preventDefault();
     if (event.code === "KeyF") {
         toggleFullscreen();
@@ -1234,7 +1263,10 @@ window.addEventListener("keydown", (event) => {
             title();
         if (event.key === "n" || event.key === "N")
             showCredits();
+        return;
     }
+    if (HORIZONTAL_KEYS.has(event.code) && !event.repeat)
+        runResponsiveFrame();
 });
 window.addEventListener("keyup", (event) => {
     state.keys.delete(event.code);
@@ -1250,5 +1282,5 @@ if ("serviceWorker" in navigator) {
 }
 makeScreen();
 title();
-window.setInterval(frame, FRAME_MS);
+window.requestAnimationFrame(gameLoop);
 //# sourceMappingURL=main.js.map

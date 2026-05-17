@@ -21,6 +21,8 @@ const ENGINE_REV_STEP_MS = 10;
 const CRASH_EFFECT_MS = 900;
 const CRASH_EFFECT_FRAME_MS = 70;
 const CUSTOM = new Set([224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235]);
+const CONTROL_KEYS = new Set(["ArrowLeft", "ArrowRight", "Space", "KeyA", "KeyD", "KeyF"]);
+const HORIZONTAL_KEYS = new Set(["ArrowLeft", "ArrowRight", "KeyA", "KeyD"]);
 const HIGH_SCORE_KEY = "high-drive.high-score";
 const TITLE_TEXT_X = 9;
 const TITLE_TEXT_Y = 6;
@@ -41,6 +43,7 @@ type NoteName = "C" | "D" | "E" | "F" | "G" | "A" | "B";
 type PlayNote = { name: NoteName; octave: number; accidental: number };
 type PlayEvent = { note?: PlayNote; duration: number };
 type PsgRegisterWrite = { register: number; value: number };
+type PendingDelayedHazards = { stage: number; stageTick: number; dueAt: number };
 
 const screen = document.querySelector<SVGSVGElement>("#screen")!;
 const cabinet = document.querySelector(".cabinet") as HTMLElement;
@@ -52,6 +55,10 @@ let psg: PsgPlayer | null = null;
 let soundToken = 0;
 let soundBlockingToken = 0;
 let soundBlocking = false;
+let loopPreviousTime = performance.now();
+let frameAccumulator = 0;
+let lastFrameTime = loopPreviousTime;
+let pendingDelayedHazards: PendingDelayedHazards | null = null;
 
 const COLORS = {
   main: "#78ff70",
@@ -92,7 +99,6 @@ const state: {
   barrel: { x: number; y: number } | null;
   flash: number;
   bonusRemaining: number;
-  delayedHazardToken: number;
 } = {
   mode: "title",
   playerX: 14,
@@ -110,7 +116,6 @@ const state: {
   barrel: null,
   flash: 0,
   bonusRemaining: 0,
-  delayedHazardToken: 0,
 };
 
 const buffer: CellBuffer[][] = Array.from({ length: ROWS }, () =>
@@ -609,7 +614,7 @@ function resetGame(): void {
   state.barrel = null;
   state.flash = 0;
   state.bonusRemaining = 0;
-  state.delayedHazardToken = 0;
+  pendingDelayedHazards = null;
 }
 
 function showCredits(): void {
@@ -778,7 +783,7 @@ function drawStatus(): void {
   else printText(29, 12, "ROAD :" + String(state.stage).padStart(4, " "), statusColor);
 }
 
-function frame(): void {
+function frame(now = performance.now()): void {
   if (isSoundProcessingBlocked()) return;
   if (state.mode === "bonus_count") {
     updateBonusCount();
@@ -816,27 +821,58 @@ function frame(): void {
   drawStatus();
   render();
   if (delayedHazards && state.mode === "play" && currentStage() === stageAtFrameStart) {
-    scheduleDelayedHazards(state.stage, state.stageTick);
+    scheduleDelayedHazards(state.stage, state.stageTick, now);
   }
 }
 
-function scheduleDelayedHazards(stage: number, stageTick: number): void {
-  const token = ++state.delayedHazardToken;
-  window.setTimeout(() => {
-    if (isSoundProcessingBlocked()) {
-      scheduleDelayedHazards(stage, stageTick);
-      return;
-    }
-    if (state.mode !== "play") return;
-    if (state.delayedHazardToken !== token) return;
-    if (state.stage !== stage || state.stageTick !== stageTick) return;
-    updateBarrels();
-    if (state.mode !== "play") return;
-    updateChaser();
-    if (state.mode !== "play") return;
-    drawStatus();
-    render();
-  }, HAZARD_DELAY_MS);
+function gameLoop(now: number): void {
+  processDelayedHazards(now);
+
+  const elapsed = Math.min(now - loopPreviousTime, FRAME_MS * 2);
+  loopPreviousTime = now;
+  frameAccumulator += elapsed;
+
+  while (frameAccumulator >= FRAME_MS) {
+    runFrame(now);
+    frameAccumulator -= FRAME_MS;
+  }
+
+  window.requestAnimationFrame(gameLoop);
+}
+
+function runFrame(now = performance.now()): void {
+  frame(now);
+  lastFrameTime = now;
+}
+
+function runResponsiveFrame(): void {
+  if (state.mode !== "play" || isSoundProcessingBlocked()) return;
+  const now = performance.now();
+  processDelayedHazards(now);
+  if (now - lastFrameTime < HAZARD_DELAY_MS) return;
+
+  frameAccumulator = 0;
+  loopPreviousTime = now;
+  runFrame(now);
+}
+
+function scheduleDelayedHazards(stage: number, stageTick: number, now: number): void {
+  pendingDelayedHazards = { stage, stageTick, dueAt: now + HAZARD_DELAY_MS };
+}
+
+function processDelayedHazards(now: number): void {
+  const pending = pendingDelayedHazards;
+  if (!pending || now < pending.dueAt || isSoundProcessingBlocked()) return;
+  pendingDelayedHazards = null;
+  if (state.mode !== "play") return;
+  if (state.stage !== pending.stage || state.stageTick !== pending.stageTick) return;
+
+  updateBarrels();
+  if (state.mode !== "play") return;
+  updateChaser();
+  if (state.mode !== "play") return;
+  drawStatus();
+  render();
 }
 
 function startBonusCount(amount: number): void {
@@ -1008,7 +1044,7 @@ function toggleFullscreen(): void {
 
 window.addEventListener("keydown", (event) => {
   state.keys.add(event.code);
-  if (["ArrowLeft", "ArrowRight", "Space", "KeyA", "KeyD", "KeyF"].includes(event.code)) event.preventDefault();
+  if (CONTROL_KEYS.has(event.code)) event.preventDefault();
 
   if (event.code === "KeyF") {
     toggleFullscreen();
@@ -1026,7 +1062,10 @@ window.addEventListener("keydown", (event) => {
   if (state.mode === "over") {
     if (event.key === "y" || event.key === "Y") title();
     if (event.key === "n" || event.key === "N") showCredits();
+    return;
   }
+
+  if (HORIZONTAL_KEYS.has(event.code) && !event.repeat) runResponsiveFrame();
 });
 
 window.addEventListener("keyup", (event) => {
@@ -1046,4 +1085,4 @@ if ("serviceWorker" in navigator) {
 
 makeScreen();
 title();
-window.setInterval(frame, FRAME_MS);
+window.requestAnimationFrame(gameLoop);
