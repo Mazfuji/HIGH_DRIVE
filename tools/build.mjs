@@ -50,6 +50,7 @@ fs.copyFileSync(path.join(srcDir, "index.html"), path.join(publicDir, "index.htm
 fs.copyFileSync(path.join(srcDir, "style.css"), path.join(publicDir, "style.css"));
 fs.copyFileSync(path.join(srcDir, "manifest.webmanifest"), path.join(publicDir, "manifest.webmanifest"));
 fs.copyFileSync(path.join(srcDir, "sw.js"), path.join(publicDir, "sw.js"));
+fs.copyFileSync(basSourcePath, path.join(publicDir, "high_drive.bas"));
 fs.mkdirSync(path.join(publicDir, "icons"), { recursive: true });
 fs.copyFileSync(path.join(srcDir, "icons", "icon.svg"), path.join(publicDir, "icons", "icon.svg"));
 fs.writeFileSync(path.join(publicDir, "icons", "icon-192.png"), createIconPng(192));

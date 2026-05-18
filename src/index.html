@@ -2,29 +2,17 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>HIGH DRIVE</title>
   <meta name="theme-color" content="#050807">
   <meta name="application-name" content="HIGH DRIVE">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-title" content="HIGH DRIVE">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="icons/icon-192.png">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <main class="cabinet">
-    <div class="bezel">
-      <svg id="screen" viewBox="0 0 320 200" aria-label="HIGH DRIVE game screen"></svg>
-      <div class="scanlines"></div>
-      <button class="fullscreen-button" id="fullscreenButton" type="button" aria-label="Toggle fullscreen" title="Fullscreen (F)">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="square">
-          <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/>
-        </svg>
-      </button>
-    </div>
+  <main class="game-shell" id="gameShell">
+    <svg id="screen" viewBox="0 0 320 200" aria-label="HIGH DRIVE game screen"></svg>
+    <div class="scanlines"></div>
   </main>
   <script src="main.js" type="module"></script>
 </body>

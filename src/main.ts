@@ -31,7 +31,8 @@ const TITLE_PROMPT_X = 9;
 const TITLE_PROMPT_Y = 15;
 const TITLE_PROMPT = "HIT ANY KEY";
 const TITLE_WALL_Y = TITLE_PROMPT_Y - 2;
-const CREDIT_URL = "https://github.com/mazfuji/high_drive";
+const CREDIT_SOURCE_URL = "high_drive.bas";
+const CREDIT_DURATION_MS = 15_000;
 const NS = "http://www.w3.org/2000/svg";
 const XLINK = "http://www.w3.org/1999/xlink";
 
@@ -46,11 +47,9 @@ type PsgRegisterWrite = { register: number; value: number };
 type PendingDelayedHazards = { stage: number; stageTick: number; dueAt: number };
 
 const screen = document.querySelector<SVGSVGElement>("#screen")!;
-const cabinet = document.querySelector(".cabinet") as HTMLElement;
-const fullscreenButton = document.getElementById("fullscreenButton") as HTMLButtonElement;
+const gameShell = document.getElementById("gameShell") as HTMLElement;
 const cells: SVGUseElement[] = [];
 const renderedCells: RenderedCell[] = [];
-let creditLink: SVGAElement | null = null;
 let psg: PsgPlayer | null = null;
 let soundToken = 0;
 let soundBlockingToken = 0;
@@ -59,6 +58,9 @@ let loopPreviousTime = performance.now();
 let frameAccumulator = 0;
 let lastFrameTime = loopPreviousTime;
 let pendingDelayedHazards: PendingDelayedHazards | null = null;
+let creditLines: string[] | null = null;
+let creditStartedAt = 0;
+let creditLastRow = Number.NaN;
 
 const COLORS = {
   main: "#78ff70",
@@ -530,24 +532,6 @@ function makeScreen(): void {
     }
   }
 
-  creditLink = document.createElementNS(NS, "a");
-  creditLink.setAttribute("href", CREDIT_URL);
-  creditLink.setAttributeNS(XLINK, "href", CREDIT_URL);
-  creditLink.setAttribute("target", "_blank");
-  creditLink.setAttribute("rel", "noopener noreferrer");
-  creditLink.style.display = "none";
-
-  const creditText = document.createElementNS(NS, "text");
-  creditText.setAttribute("x", String(roadMin() * CELL));
-  creditText.setAttribute("y", String(21 * CELL + 7));
-  creditText.setAttribute("textLength", String(ROAD_SPACES * CELL));
-  creditText.setAttribute("lengthAdjust", "spacingAndGlyphs");
-  creditText.setAttribute("font-family", "Arcade8x8ASCII, monospace");
-  creditText.setAttribute("font-size", "5");
-  creditText.setAttribute("fill", COLORS.cyan);
-  creditText.textContent = CREDIT_URL;
-  creditLink.appendChild(creditText);
-  screen.appendChild(creditLink);
 }
 
 function setCell(x: number, y: number, code: number, color = COLORS.main): void {
@@ -587,7 +571,6 @@ function drawRoadRow(y: number, left: number): void {
 
 function title(): void {
   if (psg) psg.mute();
-  hideCreditLink();
   resetGame();
   clearAll();
   clearGameArea();
@@ -619,16 +602,15 @@ function resetGame(): void {
 
 function showCredits(): void {
   state.mode = "credits";
+  creditStartedAt = performance.now();
+  creditLastRow = Number.NaN;
   clearAll();
-  clearGameArea();
-  printRoadText(4, "HIGH DRIVE", COLORS.amber);
-  printRoadText(7, "Copyright", COLORS.text);
-  printRoadText(8, "(C) 1984", COLORS.text);
-  printRoadText(11, "Hideshi", COLORS.text);
-  printRoadText(12, "Matsufuji", COLORS.text);
-  showCreditLink();
-  drawStatus();
+  printRoadText(10, "LOADING", COLORS.amber);
   render();
+  void loadCreditLines().then((lines) => {
+    creditLines = lines;
+    if (state.mode === "credits") updateCredits(performance.now(), true);
+  });
 }
 
 function printRoadText(y: number, text: string, color = COLORS.text): void {
@@ -636,12 +618,57 @@ function printRoadText(y: number, text: string, color = COLORS.text): void {
   printText(x, y, text, color);
 }
 
-function showCreditLink(): void {
-  if (creditLink) creditLink.style.display = "";
+async function loadCreditLines(): Promise<string[]> {
+  if (creditLines) return creditLines;
+  try {
+    const response = await fetch(CREDIT_SOURCE_URL, { cache: "no-store" });
+    if (!response.ok) throw new Error(`Failed to load ${CREDIT_SOURCE_URL}`);
+    const source = await response.text();
+    return [
+      "HIGH DRIVE",
+      "BASIC SOURCE CODE",
+      "",
+      "ORIGINAL PROGRAM",
+      "HIDESHI MATSUFUJI",
+      "COPYRIGHT (C) 1984",
+      "",
+      ...source.replace(/\r\n?/g, "\n").split("\n"),
+    ].map(sanitizeCreditLine);
+  } catch {
+    return [
+      "HIGH DRIVE",
+      "BASIC SOURCE CODE",
+      "",
+      "SOURCE LOAD ERROR",
+    ];
+  }
 }
 
-function hideCreditLink(): void {
-  if (creditLink) creditLink.style.display = "none";
+function sanitizeCreditLine(line: string): string {
+  return line.replace(/[^\x20-\x7e]/g, "?").slice(0, COLS);
+}
+
+function updateCredits(now: number, force = false): void {
+  if (state.mode !== "credits" || !creditLines) return;
+
+  const elapsed = now - creditStartedAt;
+  const totalRows = creditLines.length + ROWS;
+  const rowOffset = Math.floor((elapsed / CREDIT_DURATION_MS) * totalRows);
+  if (elapsed >= CREDIT_DURATION_MS || rowOffset >= totalRows) {
+    title();
+    return;
+  }
+  if (!force && rowOffset === creditLastRow) return;
+  creditLastRow = rowOffset;
+
+  clearAll();
+  for (let y = 0; y < ROWS; y++) {
+    const line = creditLines[y - ROWS + rowOffset];
+    if (line === undefined) continue;
+    const color = y < 3 ? COLORS.dim : y > ROWS - 4 ? COLORS.cyan : COLORS.text;
+    printText(0, y, line, color);
+  }
+  render();
 }
 
 function startGame(): void {
@@ -827,6 +854,7 @@ function frame(now = performance.now()): void {
 
 function gameLoop(now: number): void {
   processDelayedHazards(now);
+  updateCredits(now);
 
   const elapsed = Math.min(now - loopPreviousTime, FRAME_MS * 2);
   loopPreviousTime = now;
@@ -1038,7 +1066,7 @@ function roadRight(): number {
 }
 
 function toggleFullscreen(): void {
-  if (!document.fullscreenElement) void cabinet.requestFullscreen?.();
+  if (!document.fullscreenElement) void gameShell.requestFullscreen?.();
   else void document.exitFullscreen?.();
 }
 
@@ -1071,17 +1099,6 @@ window.addEventListener("keydown", (event) => {
 window.addEventListener("keyup", (event) => {
   state.keys.delete(event.code);
 });
-
-fullscreenButton.addEventListener("click", (event) => {
-  event.stopPropagation();
-  toggleFullscreen();
-});
-
-if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    void navigator.serviceWorker.register("sw.js");
-  });
-}
 
 makeScreen();
 title();
